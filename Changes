@@ -1,6 +1,6 @@
 Revision history for Test-Mutation
 
-0.001
+0.001  2026-11-28
     - Measure Perl modules and commands in per-job copies of the distribution.
     - Build XS distributions in the measurement copy and trace tests through child interpreters.
     - Record the test that detected a mutant after confirming that it passes with the original source.
