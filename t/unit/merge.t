@@ -1,6 +1,7 @@
 use v5.36;
 use Test2::V0;
 use Digest::SHA  ();
+use JSON::PP     ();
 use Scalar::Util qw(refaddr);
 use lib 't/lib';
 use Raised;
@@ -78,6 +79,30 @@ sub merged (@parts) {
 my @first = ( entry( 1, 'Killed' ),  entry( 3, 'Survived' ), entry( 5, 'Killed' ) );
 my @rest  = ( entry( 2, 'Timeout' ), entry( 4, 'Killed' ),   entry( 6, 'NoCoverage' ) );
 
+subtest 'reports from before embedded compiler phases can still show their measured verdicts' => sub {
+    my $early = part( '1/2', \@first, compiler_input_protocol => 1 );
+    my $old =
+      Test::Mutation::Report::Json::parse( Test::Mutation::Report::Json::render( $early, high => 80, low => 60 ) );
+    is [ $old->compiler_input_protocol, $old->measurement_digest, $old->entries->[0]{status} ],
+      [ 1, 'cd' x 32, 'Killed' ], 'the historical report preserves the protocol, original digest, and verdict';
+    is $old->verified_measurement_digest, undef,
+      'the earlier digest cannot identify inputs read inside a Perl expression';
+    like dies { merged( $old, part( '2/2', \@rest, compiler_input_protocol => 1 ) ) },
+      qr/measurement inputs are missing/, 'even matching first-generation shards must be measured again';
+    like dies { merged( part( '1/2', \@first ), part( '2/2', \@rest, compiler_input_protocol => 1 ) ) },
+      qr/measurement inputs are missing/, 'a current shard cannot certify the earlier measurement';
+};
+
+subtest 'reports written without the driver quote parser identity remain readable' => sub {
+    my @saved =
+      map { Test::Mutation::Report::Json::parse( Test::Mutation::Report::Json::render( $_, high => 80, low => 60 ) ) }
+      part( '1/2', \@first, compiler_input_protocol => 2 ), part( '2/2', \@rest, compiler_input_protocol => 2 );
+    is [ $saved[0]->compiler_input_protocol, $saved[0]->measurement_digest, $saved[0]->entries->[0]{status} ],
+      [ 2, 'cd' x 32, 'Killed' ], 'the earlier JSON preserves its recorded measurement';
+    like dies { merged(@saved) }, qr/measurement inputs are missing/,
+      'two matching earlier digests cannot verify the driver quote parsers';
+};
+
 subtest 'merging applies a common deferred threshold' => sub {
     my $result = merged( part( '1/2', \@first, min_score => 90 ), part( '2/2', \@rest, min_score => 90 ) );
     is [ $result->assessment->@{qw(minimum gate exitCode)} ], [ 90, 'failed', 1 ],
@@ -88,15 +113,16 @@ subtest 'merging applies a common deferred threshold' => sub {
         is [ merged( $first, $other_part )->assessment->@{qw(score minimum gate exitCode)} ],
           [ 60, undef, undef, 0 ], 'shards without a common threshold still yield their combined score';
     }
-    my $override = Test::Mutation::Merge::merge(
-        [
-            { name => 'first',  result => $first },
-            { name => 'second', result => part( '2/2', \@rest, min_score => 90 ) }
-        ],
-        60
-    );
+    my $reports =
+      [ { name => 'first', result => $first }, { name => 'second', result => part( '2/2', \@rest, min_score => 90 ) } ];
+    my $override = Test::Mutation::Merge::merge( $reports, 60 );
     is [ $override->assessment->@{qw(minimum gate exitCode)} ], [ 60, 'passed', 0 ],
       'a threshold requested for the whole run takes precedence at the exact combined score';
+    my $zero = Test::Mutation::Merge::merge( $reports, 0 );
+    is [ $zero->assessment->@{qw(minimum gate exitCode)} ], [ 0, 'passed', 0 ],
+      'a zero threshold overrides the higher threshold shared by both shards';
+    isa_ok dies { Test::Mutation::Merge::merge( $reports, 'unknown' ) }, ['Error::TypeTiny'],
+      'a merge rejects a nonnumeric threshold';
 };
 
 subtest 'the parts of one run merge into the result of the whole run' => sub {
@@ -196,6 +222,21 @@ subtest 'an empty shard cannot hide conflicting inputs from two measured sibling
     }
 };
 
+subtest 'shards agree on the contents of each shared compiler input' => sub {
+    my ( $shared, $extra, $seven, $five ) = map { Digest::SHA::sha256_hex($_) } qw(shared.cfg extra.cfg seven five);
+    my $first = part( '1/2', \@first, compiler_inputs => { $shared => $seven } );
+    my $both  = { $extra => $five, $shared => $seven };
+    my $rest  = part( '2/2', \@rest, compiler_inputs => $both );
+    for my $parts ( [ $first, $rest ], [ $rest, $first ] ) {
+        is merged(@$parts)->compiler_inputs, $both, 'a file used by one shard joins the matching shared input';
+    }
+    my $changed = part( '2/2', \@rest, compiler_inputs => { $extra => $five, $shared => $five } );
+    for my $parts ( [ $first, $changed ], [ $changed, $first ] ) {
+        like dies { merged(@$parts) }, qr/measurement inputs differ.*rerun every shard/,
+          'a changed shared file requires a new measurement in either report order';
+    }
+};
+
 subtest 'merging interleaves uneven shards and omits empty positions' => sub {
     for my $case ( [ 0, [ [], [], [], [] ] ], [ 2, [ [1], [2], [], [] ] ], [ 5, [ [ 1, 5 ], [2], [3], [4] ] ] ) {
         my ( $count, $groups ) = @$case;
@@ -225,6 +266,8 @@ subtest 'a cache disagreement in either shard propagates to the whole run' => su
 subtest 'a set that is not one complete run is refused' => sub {
     my $one = part( '1/2', \@first );
     my $two = part( '2/2', \@rest );
+    isa_ok dies { Test::Mutation::Merge::merge( [ { name => 'report', result => undef } ] ) }, ['Error::TypeTiny'],
+      'each named input requires a measured result';
     like Raised::message( sub { merged() } ),     qr/\Amerge needs at least one report/, 'no report';
     like Raised::message( sub { merged($one) } ), qr/\Apart 2 of 2 is missing/,          'a missing part';
     like Raised::message( sub { merged( $one, $one ) } ), qr/\Areport 1 and report 2 both hold part 1 of 2/,
@@ -332,8 +375,10 @@ subtest 'a refreshed threshold uses every row in the measured scope' => sub {
     );
     is $whole->assessment->{gate},  'unavailable',         'the whole project has no score to compare to the threshold';
     is $single->assessment->{gate}, 'no mutants selected', 'the narrowed measurement accepts an empty score';
+    is $single->score_scope,        $single->selection,    'a fresh score describes the requested selection';
     my $saved = Test::Mutation::Merge::refresh( $whole, $single );
     is $saved->assessment, $whole->assessment, 'refreshing one ignored mutant preserves the whole-project gate';
+    is $saved->score_scope, {}, 'the refreshed score includes the whole project after a single-mutant request';
 };
 
 subtest 'refresh replaces the selected verdicts and keeps independently measured changes' => sub {
@@ -396,6 +441,7 @@ subtest 'refresh replaces the selected verdicts and keeps independently measured
           Test::Mutation::Report::Json::parse( Test::Mutation::Report::Json::render( $result, high => 80, low => 60 ) );
         is [ $parsed->selection, Test::Mutation::Report::Results::overview($parsed)->[0] ],
           [ $after->selection, "Scope: $scope" ], 'JSON keeps the requested selection and the scope of the score';
+        is $parsed->score_scope, $result->score_scope, 'reopening a report retains the scope of its score';
     }
     my $from_whole = Test::Mutation::Merge::refresh( $whole, $file_selection );
     my $reopened =
@@ -413,13 +459,20 @@ subtest 'refresh replaces the selected verdicts and keeps independently measured
       'current compiler observations can verify every earlier input and add a new one';
     is $verified->compiler_inputs, $superset->compiler_inputs,
       'the refreshed result carries the evidence for every input';
+    my $old_document = Test::Mutation::Report::Json::document( $compiled, high => 80, low => 60 );
+    delete $old_document->{testMutation}{compilerInputProtocol};
+    my $old_measurement = Test::Mutation::Report::Json::parse( JSON::PP->new->encode($old_document) );
+    is Test::Mutation::Merge::refresh( $old_measurement, $superset ), $superset,
+      'a partial update cannot vouch for rows from before compiler input verification';
 
+    my $early_protocol = { compiler_input_protocol => 1 };
     for my $case (
         [ 'a prior shard',                      { shard => '1/2' },              {} ],
         [ 'a current shard',                    {},                              { shard => '2/2' } ],
         [ 'another project',                    { root => '/other' },            {} ],
         [ 'a legacy prior report',              { catalog_digest => undef },     {} ],
         [ 'a legacy current report',            {},                              { catalog_digest => undef } ],
+        [ 'an earlier compiler input protocol', $early_protocol,                 {} ],
         [ 'another catalog',                    { catalog_digest => 'cd' x 32 }, {} ],
         [ 'a whole run',                        {},                              { selection          => {} } ],
         [ 'changed measurement inputs',         {},                              { measurement_digest => 'ab' x 32 } ],

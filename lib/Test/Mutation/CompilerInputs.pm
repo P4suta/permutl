@@ -92,6 +92,12 @@ Test::Mutation::CompilerInputs - record external inputs to a standalone Perl com
 The driver loads this module in the target Perl before a standalone compilation.
 The module records additional library directories and modules loaded outside the initial search path.
 For known read-only C<open> calls, the target interpreter resolves literal paths and named environment variables.
-The driver checks the load-time code of non-core modules before it trusts an environment-derived path.
+The driver checks the load-time code of non-core modules before it trusts a file operand read during compilation.
+Requiring any selected file also runs its file-scope code, which a standalone syntax check skips.
+With equivalence checks enabled, cached and reported verdicts share an original compilation when the source may load a module or read a file.
+An operand discovered in a loaded module takes a second pass to identify its file.
+Reports and shards use the target Perl's C<-c> check to record inputs when equivalence checking is disabled.
+Merging shards requires a complete compiler input record.
+A compile-time assignment can change a package variable without changing the deparsed program.
 
 =cut

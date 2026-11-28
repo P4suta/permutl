@@ -12,7 +12,7 @@
 ^Test-Mutation-
 ^release-please-config\.json$
 ^xt/(?:release-please|release-publish)/
-^xt/(?:publication-workflow|release-archive|release-workflow)\.t$
-^xt/bin/verify-release-archive$
+^xt/(?:ci-interpreters|local-release-check|publication-workflow|release-archive|release-workflow)\.t$
+^xt/bin/(?:check-ci-interpreters|record-release-check|verify-local-release-check|verify-release-archive)$
 \.log$
 \.tar\.gz$

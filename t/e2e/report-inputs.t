@@ -2,6 +2,8 @@ use v5.36;
 use Test2::V0;
 use Cwd        ();
 use File::Temp ();
+use lib 't/lib';
+use Capability;
 use lib 't/e2e/lib';
 use Fixture qw(copy_of run_fixture write_file);
 use Test::Mutation::Merge;
@@ -86,6 +88,16 @@ PERL
     is subtraction($visible), 'Killed', 'an in-place test can observe the actual report directory';
     my ($linked) = run_fixture( $root, %settings, link => ['history'] );
     is subtraction($linked), 'Killed', 'a directory explicitly linked to the project keeps its published reports';
+    subtest 'an unreadable project link leaves the published report outside an isolated copy' => sub {
+        Capability::has( 'unprivileged', $> != 0, 'the project link must be unreadable' ) or return;
+        my $private = write_file( "$root/private-input", "unused\n" );
+        chmod 0, $private or die "protect $private: $!";
+        my ($uncertified) = run_fixture( $root, %settings, link => ['private-input'] );
+        unlink $private or die "remove $private: $!";
+        is $uncertified->baseline_failures,  [],         'the original test can run without reading the linked input';
+        is $uncertified->measurement_digest, undef,      'the unreadable input prevents shard certification';
+        is subtraction($uncertified),        'Survived', 'writing a report cannot change the operand in the test copy';
+    };
     symlink 'history/part/mutation.json', "$root/operand.json" or die "link input: $!";
     write_file( "$root/t/linked.t", <<'PERL' );
 use Test::More tests => 1;

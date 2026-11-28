@@ -3,7 +3,7 @@ use Test2::V0;
 use Cwd        ();
 use File::Temp ();
 use lib 't/contract/lib', 't/e2e/lib', 't/lib';
-use Fixture qw(copy_of write_file);
+use Fixture qw(copy_of with_driver_shims write_file);
 use Gate;
 use Samples;
 use Test::Mutation::Settings;
@@ -49,8 +49,13 @@ sub project (%files) {
 # A run of a project in this process, which gives the reasons of its mutants.
 # The answer maps each source to the pairs that its mutants give, so a case names the source of each reason.
 sub measured ( $root, %settings ) {
-    my $config  = Test::Mutation::Settings::of_call( { root => $root, jobs => 2, %settings } );
-    my @entries = Test::Mutation::Runner::run( $config, sub (@) { return } )->entries->@*;
+    my $config = Test::Mutation::Settings::of_call( { root => $root, jobs => 2, %settings } );
+    my $result = with_driver_shims(
+        sub {
+            Test::Mutation::Runner::run( $config, sub (@) { return } );
+        }
+    );
+    my @entries = $result->entries->@*;
     gave(@entries);
     my %by_path;
     for my $entry (@entries) {

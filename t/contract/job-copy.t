@@ -104,6 +104,76 @@ MODULE
     ok $served->{hits}{4} && !$served->{hits}{5}, 'only the method invoked by the child has a hit';
 };
 
+subtest 'exec can load the same module without tracing its second interpreter' => sub {
+    my $project = ShimHarness::project();
+    my $source  = "$project/lib/Example.pm";
+    write_file( $source, "package Example;\nsub before { 23 }\nsub after { 47 }\n1;\n" );
+    my $settings = "trace\t1\nplaced\t1\ntarget\t$source\t$source\n";
+    write_file( "$project/traced.spec", $settings );
+    write_file( "$project/disk.spec",   $settings . "observe\t1\n" );
+    write_file( "$project/first.pl",    <<'PERL' );
+require Example;
+die 'the first interpreter did not execute the module' unless Example::before() == 23;
+$ENV{TEST_MUTATION_SPEC} = 'disk.spec';
+exec {$^X} $^X, @ARGV, '-MTest::Mutation::Shim', 'second.pl', $$ or die "exec: $!";
+PERL
+    write_file( "$project/second.pl", <<'PERL' );
+die 'exec changed the PID' unless $$ == shift;
+require Example;
+print Example::after();
+PERL
+    my @libraries = ( '-I' . ShimHarness::lib_dir(), "-I$project/lib" );
+    my $run       = ShimHarness::run_bare(
+        root => $project,
+        args => [ @libraries, '-MTest::Mutation::Shim', 'first.pl', @libraries ],
+        env  => { TEST_MUTATION_SPEC => 'traced.spec', TEST_MUTATION_RECORD => "$project/records" }
+    );
+    is [ $run->@{qw(status stdout stderr)} ], [ 0, '47', q{} ], 'both interpreters execute the module at the same PID';
+    my ($file) = glob "$project/records/*.rec";
+    like Test::Mutation::Source::read_bytes($file),
+      qr/^seen\t\Q$source\E\n.*^begin\t1\n.*^blind\t\Q$source\E\tloaded-at-exit$/ms,
+      'the replacement reports its own disk load';
+    my $record = Test::Mutation::Record::read_directory("$project/records");
+    is [ $record->@{qw(begun ended)} ], [ 2, 1 ], 'only the replacement interpreter runs its END block';
+    my $served = $record->{served}{$source};
+    ok $served->{hits}{2} && !$served->{hits}{3}, 'only the call before exec has a line hit';
+    is $served->{traced}, 0, 'the untraced load in the replacement interpreter requires file coverage';
+};
+
+subtest 'two observers in one interpreter can identify the same traced load' => sub {
+    my $project = ShimHarness::project();
+    my $source  = "$project/lib/Example.pm";
+    write_file( $source, "package Example;\nsub value { 23 }\n1;\n" );
+    my $settings = "trace\t1\nplaced\t1\ntarget\t$source\t$source\n";
+    write_file( "$project/traced.spec",                  $settings );
+    write_file( "$project/disk.spec",                    $settings . "observe\t1\n" );
+    write_file( "$project/lib/Test/Mutation/Shim/G1.pm", Test::Mutation::Runner::shim_text(1) );
+    write_file( "$project/observers.pl",                 <<'PERL' );
+require Example;
+die 'the module did not run' unless Example::value() == 23;
+require Test::Mutation::Shim::G1;
+Test::Mutation::Shim::G1->import();
+PERL
+    my $run = ShimHarness::run_bare(
+        root => $project,
+        args => [ '-I' . ShimHarness::lib_dir(), "-I$project/lib", '-MTest::Mutation::Shim', 'observers.pl' ],
+        env  => {
+            TEST_MUTATION_SPEC      => 'traced.spec',
+            TEST_MUTATION_RECORD    => "$project/records",
+            TEST_MUTATION_SPEC_G1   => 'disk.spec',
+            TEST_MUTATION_RECORD_G1 => "$project/records"
+        }
+    );
+    is [ $run->@{qw(status stderr)} ], [ 0, q{} ], 'both observers share the interpreter that executed the module';
+    my ($file) = glob "$project/records/*.rec";
+    like Test::Mutation::Source::read_bytes($file),
+      qr/^seen\t\Q$source\E\n.*^begin\t1\n.*^blind\t\Q$source\E\tloaded-at-exit$/ms,
+      'the second observer finds the loaded file';
+    my $record = Test::Mutation::Record::read_directory("$project/records");
+    is [ $record->@{qw(begun ended)} ],    [ 2, 2 ], 'both observers reach their END blocks';
+    is $record->{served}{$source}{traced}, 1,        'the second observer finds the compilation traced by the first';
+};
+
 subtest 'an installed command without a blib/bin entry receives the changed bytes' => sub {
     my $tree = Cwd::abs_path( File::Temp::tempdir( CLEANUP => 1 ) );
     write_file( "$tree/bin/tool",         $original );
@@ -188,26 +258,34 @@ subtest 'a failing write, mode change or rename preserves the existing entry' =>
 };
 
 subtest 'the shim distinguishes a placed source on disk from a load outside the hook' => sub {
+    my $check = <<'PERL';
+my @loaded = stat $INC{'Example.pm'};
+my @placed = stat 'lib/Example.pm';
+exit 2 unless @loaded && @placed && $loaded[0] == $placed[0] && $loaded[1] == $placed[1];
+print Example::value();
+PERL
     for my $case ( [ 1, 'blind' ], [ 0, 'around' ] ) {
         my ( $placed_on_disk, $record ) = @$case;
         my $project = ShimHarness::project();
         my $target  = "$project/lib/Example.pm";
-        write_file( $target,              "package Example;\nsub value { 24 }\n1;\n" );
+        write_file( $target,              "package Example;\nsub value { 24 }\nsub unused { die 'unused' }\n1;\n" );
         write_file( "$project/unused.pm", "die 'the hook must not replace this file';\n" );
         write_file( "$project/spec",
             "trace\t0\nplaced\t$placed_on_disk\nobserve\t1\ntarget\t$target\t$project/unused.pm\n" );
         my $result = ShimHarness::run_perl(
             root => $project,
             env  => { TEST_MUTATION_SPEC => "$project/spec", TEST_MUTATION_RECORD => "$project/records" },
-            args => [
-                '-I' . ShimHarness::lib_dir(), '-MTest::Mutation::Shim',
-                '-Ilib',                       '-MExample',
-                '-e',                          'print Example::value()'
-            ],
+            args => [ '-I' . ShimHarness::lib_dir(), '-MTest::Mutation::Shim', '-Ilib', '-MExample', '-e', $check ],
         );
         is [ $result->{status}, $result->{stdout} ], [ 0, '24' ], 'the interpreter reads the source bytes from disk';
         is [ map { [ $_->[0], $_->[1] ] } grep { $_->[0] ne 'end' } ShimHarness::records($project)->@* ],
           [ [ $record, $target ] ], 'the observation identifies whether the file was placed in the copy';
+        my $raw = ShimHarness::all_records($project);
+        is [ map { $_->[1] } grep { $_->[0] eq 'begin' } @$raw ], [0], 'the interpreter ran without line tracing';
+        my $read = Test::Mutation::Record::read_directory("$project/records");
+        is [ $read->{served}{$target}, $read->{compiled}{$target}, $read->{bypassed}{$target} ],
+          $placed_on_disk ? [ { traced => 0, hits => {} }, 1, undef ] : [ undef, undef, 1 ],
+          'the placed file has file coverage and the unplaced file records a bypass';
     }
 };
 

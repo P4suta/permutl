@@ -16,7 +16,14 @@ local $ENV{MUTATION_CHECKPOINT_TEST} = $control;
 for my $name (qw(Quiet Noisy)) {
     write_file( "$project/lib/$name.pm", "package $name;\n" . 'sub sum { return $_[0] + $_[1] }' . "\n1;\n" );
 }
-write_file( "$project/t/quiet.t", "use Test::More tests => 1;\nuse Quiet;\nis Quiet::sum(7, 2), 9;\n" );
+write_file( "$project/t/quiet.t", <<'TEST' );
+use Test::More tests => 1;
+use Quiet;
+my $sum = Quiet::sum(7, 2);
+my $started = "$ENV{MUTATION_CHECKPOINT_TEST}/quiet-started";
+if ($sum != 9 && !-d $started) { mkdir $started or die "mark the running mutant: $!" }
+is $sum, 9;
+TEST
 write_file( "$project/t/noisy.t", <<'TEST' );
 use strict;
 use warnings;
@@ -67,6 +74,7 @@ my $result;
 {
     no warnings 'redefine';
     local *Test::Mutation::Store::checkpoints = sub ($path) {
+        ok !-d "$control/quiet-started", 'the writer opens before live mutant tests can need supervision';
         my $write = $checkpoints->($path);
         return sub (@arguments) {
             $locker ||= hold_until_drained($path);

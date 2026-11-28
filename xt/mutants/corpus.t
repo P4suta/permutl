@@ -67,13 +67,7 @@ sub equivalence_ok ( $scope, $summary ) {
     note sprintf '%s: %s keeps the code of the original in %d of %d compared mutants (%.1f%%)', $scope, $_->@[ 0 .. 2 ],
       100 * $_->[3]
       for Oracle::rates( $tally, 'equivalent', 'compared' );
-    Gate::findings(
-        "mutants-c-$scope",
-        Oracle::rated(
-            $tally, 'equivalent', 'compared', $EQUIVALENT,
-            'compiles to the code of the original in more than 2 percent of its mutants'
-        )
-    );
+    Gate::findings( "mutants-c-$scope", Oracle::equivalence_findings( $summary, $EQUIVALENT ) );
     return;
 }
 

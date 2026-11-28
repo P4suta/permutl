@@ -2,7 +2,7 @@ use v5.36;
 use Test2::V0;
 use JSON::PP ();
 use lib 't/e2e/lib', 't/contract/lib';
-use Fixture qw(copy_of write_file);
+use Fixture qw(copy_of with_driver_shims write_file);
 use World;
 use Test::Mutation;
 use Test::Mutation::Store;
@@ -45,7 +45,7 @@ sub traced ($operation) {
         );
         return $db;
     };
-    my $result = $operation->();
+    my $result = with_driver_shims($operation);
     return ( $result, \%counts );
 }
 
@@ -80,11 +80,15 @@ is $private->{connections}, 0, 'an uncached command opens no existing SQLite sto
 subtest 'an unfinished mutant keeps the timestamp of its last verdict' => sub {
     my @killed  = grep { $_->{status} eq 'Killed' } $warm->entries->@*;
     my $sent    = 0;
-    my $stopped = Test::Mutation::run(
-        root     => $root,
-        jobs     => 1,
-        mutant   => [ map { $_->{mutant}->id } @killed ],
-        on_event => sub ( $event, $value ) { kill 'TERM', $$ if $event eq 'mutant' && !$sent++ }
+    my $stopped = with_driver_shims(
+        sub {
+            Test::Mutation::run(
+                root     => $root,
+                jobs     => 1,
+                mutant   => [ map { $_->{mutant}->id } @killed ],
+                on_event => sub ( $event, $value ) { kill 'TERM', $$ if $event eq 'mutant' && !$sent++ }
+            );
+        }
     );
     is $stopped->interrupted, 'TERM', 'the repeated measurement stops after a committed mutant';
     my ($waiting) = grep { $_->{status} eq 'Pending' } $stopped->entries->@*;

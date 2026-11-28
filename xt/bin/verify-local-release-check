@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${SOURCE_SHA:?}" "${REPOSITORY_OWNER_ID:?}" "${GITHUB_REPOSITORY:?}"
+[[ ${SOURCE_SHA} =~ ^[0-9a-f]{40}$ && ${REPOSITORY_OWNER_ID} =~ ^[1-9][0-9]*$ ]]
+
+latest_status() {
+	gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/commits/${1}/statuses?per_page=100" |
+		jq -er --arg owner "${REPOSITORY_OWNER_ID}" '
+      if type != "array" or length == 0 or any(.[]; type != "array") then error("Unexpected commit status response") else . end |
+      [.[][] | select((.context | ascii_downcase) == "release/local")] | first |
+      if . == null then "missing"
+      elif .state == "success" and (.creator.id | tostring) == $owner then "approved"
+      else "refused" end'
+}
+
+status=$(latest_status "${SOURCE_SHA}")
+if [[ ${status} == approved ]]; then exit 0; fi
+if [[ ${status} != missing || ${GITHUB_EVENT_NAME:?} != pull_request || ${GITHUB_SHA:?} != "${SOURCE_SHA}" ]]; then
+	echo "The candidate needs a successful release/local status from the repository account." >&2
+	exit 1
+fi
+
+# The repository's release-please GitHub App publishes proposals with this numeric bot identity.
+head=$(jq -er --arg repo "${GITHUB_REPOSITORY}" --arg source "${SOURCE_SHA}" '
+  select(.action == "closed" and .repository.full_name == $repo) | .pull_request |
+  select(.merged == true and .state == "closed" and .merge_commit_sha == $source
+    and .base.repo.full_name == $repo and .base.ref == "main"
+    and .head.repo.full_name == $repo and .head.ref == "release-please--branches--main"
+    and .user.type == "Bot" and .user.id == 297731343) | .head.sha |
+  select(type == "string" and test("\\A[0-9a-f]{40}\\z"))' "${GITHUB_EVENT_PATH:?}") || {
+	echo "The event must identify a merged release proposal for this commit." >&2
+	exit 1
+}
+
+git_tree() {
+	gh api "repos/${GITHUB_REPOSITORY}/git/commits/${1}" |
+		jq -er --arg sha "${1}" 'select(.sha == $sha) | .tree.sha | select(type == "string" and test("\\A[0-9a-f]{40}\\z"))'
+}
+
+source_tree=$(git_tree "${SOURCE_SHA}")
+head_tree=$(git_tree "${head}")
+if [[ ${source_tree} != "${head_tree}" ]]; then
+	echo "The release commit and the pull request have different Git trees." >&2
+	exit 1
+fi
+status=$(latest_status "${head}")
+if [[ ${status} != approved ]]; then
+	echo "The release proposal needs a successful release/local status from the repository account." >&2
+	exit 1
+fi

@@ -8,33 +8,36 @@ date: 2026-11-27
 ## Context
 
 The [existing merge](merge-shard-reports-only-as-one-complete-run.md) checks inventory.
-Splitting a Fold duplicate lowers its score from 75.0% to 66.7%.
-Different tests can share an inventory.
+Splitting Fold duplicates lowers its score from 75.0% to 66.7%.
+Different compile-time data can initialize package variables with identical deparsed code.
 
 ## Decision
 
 Store test observations and compiler comparisons per mutant.
 Fingerprint sources, tests, execution settings, interpreter, and dependencies.
-Verify the prepared copy and key cached observations to its inputs.
-Compare shared compiler inputs by content because shards can compile different modules.
-Exclude unchanged published reports at their recorded paths from isolated copies and fingerprints.
-Fingerprint reports visible in place or through linked inputs.
-Reuse a detection when every covering test through its first failure matches.
-Interleave shards and verify inventory order before classifying duplicates.
-Keep the first undetected mutant with each compiled digest in each source file.
+Verify copied inputs and key cached observations to them.
+Require identified compiler inputs and compare shared inputs by content.
+Match the driver's `PPI`, `PPIx::QuoteLike`, and `PPIx::Regexp` versions when reusing cached observations or merging shards.
+Require a known compiler input protocol when merging or refreshing saved verdicts.
+Exclude unchanged published reports from isolated copies at their recorded paths.
+Fingerprint reports visible in place or through links.
+Reuse detections when covering tests through the first failure match.
+Interleave shards in verified inventory order.
+Keep each source's first undetected mutant per compiled digest.
 
 ## Alternatives
 
-Sharding by file keeps duplicates together but can overload one worker.
-Recompiling requires the original interpreter and dependencies.
+File-based shards can overload one worker.
+Recompilation requires the original environment.
 
 ## Consequences
 
-Shard reports support offline merging.
-Earlier reports remain readable and require remeasurement to merge.
+Merge verified reports offline.
+Older reports remain readable.
+Use an unsplit run when compiler inputs remain unknown.
 
 ## Confirmation
 
-Compare Fold verdicts, reasons, scores, and exit statuses across both modes.
-Reject reordered mutants and shards with different inputs.
+Compare Fold verdicts, reasons, scores, and exits across modes.
+Reject reordered mutants and incompatible inputs.
 Revisit the inputs when the launcher gains a dependency.

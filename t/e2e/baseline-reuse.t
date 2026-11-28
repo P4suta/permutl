@@ -3,7 +3,7 @@ use Test2::V0;
 use Digest::SHA ();
 use File::Temp  ();
 use lib 't/e2e/lib';
-use Fixture qw(ran run_fixture write_file);
+use Fixture qw(ran run_fixture with_driver_shims write_file);
 use Test::Mutation::Error;
 use Test::Mutation::Report::Json;
 use Test::Mutation::Store;
@@ -24,15 +24,12 @@ my ( @phases, @baselines );
 sub original () {
     @phases    = ();
     @baselines = ();
-    return Test::Mutation::Runner::run(
-        $config,
-        sub ( $event, $data ) {
-            push @phases,    $data->{name}                if $event eq 'phase';
-            push @baselines, [ $data->@{qw(tests jobs)} ] if $event eq 'baseline';
-            return;
-        },
-        { baseline_only => 1 }
-    );
+    my $listener = sub ( $event, $data ) {
+        push @phases,    $data->{name}                if $event eq 'phase';
+        push @baselines, [ $data->@{qw(tests jobs)} ] if $event eq 'baseline';
+        return;
+    };
+    return with_driver_shims( sub { Test::Mutation::Runner::run( $config, $listener, { baseline_only => 1 } ) } );
 }
 
 my $cold = original();

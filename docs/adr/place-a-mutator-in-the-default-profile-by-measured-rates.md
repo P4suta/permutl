@@ -21,14 +21,15 @@ Keeping every mutator enabled gives wider coverage at the cost of uninformative 
 
 ## Consequences
 
-Keep `comparison-boundary`, `call-swap`, and `bitwise` in the extended profile.
-Boundary changes reproduced the original code in 2/74 project cases and 0/62 dependency cases.
-Call swaps reproduced it in 0/97 and 2/64 respectively.
-In a fresh dependency install, 1 of 8 sampled bitwise changes reproduced the original code.
-Perl removed the debugger branch containing the bitwise operation in `namespace::clean`.
-All 25 boundary probes and all 22 call swaps loaded.
-Among default candidates, statement removal failed 1/32 load probes.
-Every other candidate loaded throughout its sample.
+Keep `comparison-boundary`, `call-swap`, `bitwise`, and `early-exit` in the extended profile.
+Boundary changes matched 2/74 project originals and 0/62 dependency originals.
+Call swaps matched 0/97 and 2/64 respectively.
+One of eight bitwise changes matched because Perl removed a debugger branch in `namespace::clean`.
+On Perl 5.44, 2/70 guarded exits matched inside version checks in `Module::Runtime` and `namespace::clean`.
+Perl 5.10 can execute the guarded `eval` in `namespace::clean`.
+The project enables `early-exit` for self-measurement.
+All 25 boundary changes and 22 call swaps loaded.
+Among default candidates, only statement removal failed a load probe, in 1/32 cases.
 
 ## Confirmation
 

@@ -522,13 +522,28 @@ subtest 'the rate rejects a mutator of the default profile above its bound, and 
     Oracle::count( $tally, 'number-literal',      'equivalent', 5 );
     Oracle::count( $tally, 'negation',            'equivalent', 1 );
     is Oracle::rated( $tally, 'equivalent', 'compared', 0.02, 'is equivalent too often' ),
-      ['comparison-negation is equivalent too often'],
+      ['comparison-negation is equivalent too often (3 of 100, limit 2%)'],
       'a share above the bound fails, a share at the bound passes, and a mutator of the extended profile has no bound';
     is Oracle::rated( $tally, 'equivalent', 'compared', 0.5, 'is equivalent too often' ), [],
       'a mutator without a base has no rate';
     is [ Oracle::rates( $tally, 'equivalent', 'compared' ) ],
       [ [ 'arithmetic', 2, 100, 0.02 ], [ 'comparison-negation', 3, 100, 0.03 ], [ 'number-literal', 5, 10, 0.5 ] ],
       'each mutator with a base has its count, its base, and its rate';
+    my $summary = Oracle::summary(
+        [
+            [ 'lib/Guard.pm', 'count', 'arithmetic', 'compared',   70 ],
+            [ 'lib/Guard.pm', 'count', 'arithmetic', 'equivalent', 2 ],
+            [
+                'lib/Guard.pm', 'finding', 'c',
+                'arithmetic compiles to the code of the original',
+                'lib/Guard.pm line 4: + -> -'
+            ],
+        ]
+    );
+    is Oracle::equivalence_findings( $summary, 0.02 ),
+      ['arithmetic compiles to the code of the original (2 of 70, limit 2%), for example lib/Guard.pm line 4: + -> -'],
+      'a failing release sample identifies the file and change that produced the same code';
+    is Oracle::equivalence_findings( $summary, 0.03 ), [], 'a sample within the limit produces no finding';
 };
 
 sub written ( $directory, $name, $text ) {

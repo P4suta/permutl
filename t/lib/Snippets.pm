@@ -35,7 +35,12 @@ sub operands () {
 
 sub expression ( $operator, $before, $after ) {
     my $body = join q{}, grep { defined } $before->{body}, $after->{body};
-    return { text => "$before->{left} $operator $after->{right}", body => $body, operator => $operator };
+    return {
+        text        => "$before->{left} $operator $after->{right}",
+        body        => $body,
+        operator    => $operator,
+        operator_at => 1 + length $before->{left}
+    };
 }
 
 # PPI knows the signatures of a file from its `use v5.36`.
@@ -46,25 +51,31 @@ my $UNKNOWN = "use v5.20;\nBEGIN { require feature; feature->import(qw(signature
 # The contexts that run an expression, each as the code of one package with EXPR in the place of the expression.
 # `last` marks the context whose expression ends the file in the place of the true value.
 # `loads` marks a context that runs its expression when the file loads, so perl loads each mutant there too.
+# `scalar` marks a context that consumes the expression in scalar context regardless of its caller.
 my @CONTEXTS = (
-    { name => 'assignment',                        code => 'sub c { my $v = EXPR; return $v }' },
-    { name => 'statement',                         code => 'EXPR;', loads => 1 },
-    { name => 'return',                            code => 'sub c { return EXPR }' },
-    { name => 'argument',                          code => 'sub c { return f(EXPR) }' },
-    { name => 'compound condition',                code => 'sub c { if (EXPR) { return 1 } return 0 }' },
-    { name => 'modifier',                          code => 'sub c { return 1 if EXPR; return 0 }' },
-    { name => 'ternary condition',                 code => 'sub c { return EXPR ? 1 : 0 }' },
-    { name => 'ternary first branch',              code => 'sub c { return $x ? EXPR : 0 }' },
-    { name => 'ternary second branch',             code => 'sub c { return $x ? 0 : EXPR }' },
-    { name => 'signature default',                 code => 'sub c ( $v = EXPR ) { return $v }' },
-    { name => 'signature default, unknown to PPI', code => 'sub c ( $v = EXPR ) { return $v }', header => $UNKNOWN },
+    { name => 'assignment',            code => 'sub c { my $v = EXPR; return $v }', scalar => 1 },
+    { name => 'statement',             code => 'EXPR;',                             loads  => 1 },
+    { name => 'return',                code => 'sub c { return EXPR }' },
+    { name => 'argument',              code => 'sub c { return f(EXPR) }' },
+    { name => 'compound condition',    code => 'sub c { if (EXPR) { return 1 } return 0 }', scalar => 1 },
+    { name => 'modifier',              code => 'sub c { return 1 if EXPR; return 0 }',      scalar => 1 },
+    { name => 'ternary condition',     code => 'sub c { return EXPR ? 1 : 0 }',             scalar => 1 },
+    { name => 'ternary first branch',  code => 'sub c { return $x ? EXPR : 0 }' },
+    { name => 'ternary second branch', code => 'sub c { return $x ? 0 : EXPR }' },
+    { name => 'signature default',     code => 'sub c ( $v = EXPR ) { return $v }', scalar => 1 },
+    {
+        name   => 'signature default, unknown to PPI',
+        code   => 'sub c ( $v = EXPR ) { return $v }',
+        header => $UNKNOWN,
+        scalar => 1
+    },
     { name => 'map block',               code => 'sub c { return map { EXPR } 1 .. 3 }' },
-    { name => 'grep block',              code => 'sub c { return grep { EXPR } 1 .. 3 }' },
-    { name => 'sort block',              code => 'sub c { return sort { EXPR } 1 .. 3 }' },
+    { name => 'grep block',              code => 'sub c { return grep { EXPR } 1 .. 3 }', scalar => 1 },
+    { name => 'sort block',              code => 'sub c { return sort { EXPR } 1 .. 3 }', scalar => 1 },
     { name => 'here-document statement', code => "sub c { my \@v = ( EXPR, <<'TEXT' ); return \@v }\ntext\nTEXT" },
-    { name => 'or die',                  code => q{sub c { EXPR or die 'no value'; return 1 }} },
+    { name => 'or die',                  code => q{sub c { EXPR or die 'no value'; return 1 }}, scalar => 1 },
     { name => 'final statement',         code => 'EXPR;', last => 1, loads => 1 },
-    { name => 'BEGIN block',             code => 'BEGIN { my $v = EXPR; }' },
+    { name => 'BEGIN block',             code => 'BEGIN { my $v = EXPR; }', scalar => 1 },
     { name => 'use statement',           code => 'use constant LIMIT => EXPR;' },
 );
 
@@ -217,15 +228,21 @@ sub difference ( $here, $there ) {
 
 my %reference;
 
-# The changes of an expression in the context that assigns it to a variable, which every other context is held to.
+# The scalar assignment supplies the reference for changes inside an expression.
 sub _reference_changes ($expression) {
     return $reference{ $expression->{text} } ||=
       _expression_changes( { header => $KNOWN, $CONTEXTS[0]->%* }, $expression );
 }
 
 # What a context does to the changes of an expression, beside the context that assigns the expression to a variable.
-sub lost ( $context, $expression ) {
-    return difference( _expression_changes( $context, $expression ), _reference_changes($expression) );
+sub lost ( $context, $expression, $actual = undef ) {
+    $actual //= _expression_changes( $context, $expression );
+    my $reference = _reference_changes($expression);
+    return difference( $actual, $reference ) unless $expression->{operator} eq '...';
+    my $endpoint = "$expression->{operator_at} ... -> .. range-boundary";
+    my @expected = grep { $_ ne $endpoint } $reference->@*;
+    push @expected, $endpoint if $context->{scalar};
+    return difference( $actual, \@expected );
 }
 
 # The snippets of a list of tuples: the operator, both operands, and the context of each tuple.
@@ -263,7 +280,7 @@ sub _snippet_records ( $judge, $snippet ) {
     my ( $from, $to ) = $file->{spans}[0]->@*;
     my $candidates = Oracle::candidates( $source, $made );
     my @here       = inside( $candidates, $file->{spans}[0] );
-    my @changes    = difference( \@here, _reference_changes($expression) )->@*;
+    my @changes    = lost( $context, $expression, \@here )->@*;
 
     # The lines before the code of the context are the same in every snippet, and so are their mutants and refusals.
     # A mutant apart from the expression is the same in every snippet of its context, so perl judges it in a sample.

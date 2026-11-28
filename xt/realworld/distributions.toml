@@ -25,8 +25,8 @@ tests = ["prove", "-lr", "t"]
 options = ["--shard", "1/4"]
 
 [TOML-Tiny.expect]
-mutants = [153, 153]
-score = [76.1, 76.2]
+mutants = [152, 152]
+score = [72.8, 72.9]
 warnings = []
 seconds = 300
 
@@ -58,8 +58,9 @@ tests = ["make", "test"]
 options = []
 
 [Params-Util.expect]
-mutants = [230, 230]
-score = [84.7, 84.8]
+mutants = [226, 226]
+score = [84, 84.1]
+verdicts = { "e4929e72e9e8" = "NoCoverage" }
 warnings = []
 seconds = 30
 
@@ -77,8 +78,9 @@ switch = ["-Iblib/lib", "-Iblib/arch"]
 '''
 
 ["Params-Util with blib".expect]
-mutants = [230, 230]
-score = [84.7, 84.8]
+mutants = [226, 226]
+score = [84, 84.1]
+verdicts = { "e4929e72e9e8" = "NoCoverage" }
 warnings = []
 seconds = 30
 
@@ -130,8 +132,24 @@ tests = ["prove", "-lr", "t"]
 options = ["--shard", "1/4"]
 
 [Moo.expect]
-mutants = [306, 306]
-score = [67.3, 67.4]
+mutants = [303, 303]
+score = [64.6, 64.7]
+warnings = []
+seconds = 120
+
+["Moo by mutant ID"]
+name = "Moo"
+version = "2.005005"
+pathname = "H/HA/HAARG/Moo-2.005005.tar.gz"
+sha256 = "fb5a2952649faed07373f220b78004a9c6aba387739133740c1770e9b1f4b108"
+shape = "a statement in the type map that the upstream tests do not reach"
+build = []
+tests = ["prove", "-lr", "t"]
+options = ["--mutant", "0aab79c15dd2"]
+
+["Moo by mutant ID".expect]
+mutants = [1, 1]
+score = [0, 0]
 verdicts = { "0aab79c15dd2" = "NoCoverage" }
 warnings = []
 seconds = 120
@@ -147,8 +165,8 @@ tests = ["prove", "-lr", "t"]
 options = ["--shard", "1/8"]
 
 [URI.expect]
-mutants = [328, 328]
-score = [78.2, 78.3]
+mutants = [325, 325]
+score = [81.5, 81.6]
 warnings = ["standalone"]
 seconds = 120
 
@@ -164,7 +182,7 @@ options = []
 
 [CPAN-Audit.expect]
 baseline_failures = ["t/cli/dist.t"]
-mutants = [450, 450]
+mutants = [446, 446]
 warnings = []
 seconds = 60
 
@@ -183,8 +201,8 @@ test-exclude = ["t/cli/dist.t"]
 '''
 
 ["CPAN-Audit without the test outside its list".expect]
-mutants = [113, 113]
-score = [64.6, 64.7]
+mutants = [112, 112]
+score = [65.1, 65.2]
 warnings = []
 seconds = 120
 
@@ -199,13 +217,29 @@ tests = ["prove", "-lr", "t"]
 options = []
 
 [Module-Runtime.expect]
-mutants = [86, 86]
-score = [73.2, 73.3]
+mutants = [85, 85]
+score = [74.1, 74.2]
 warnings = []
 seconds = 30
 
 [Module-Runtime.expect.verdicts]
 "23b684b1d7d2" = "Survived"
-"a69ddf608877" = "Survived"
 "ca469947a037" = "Survived"
 "efbd4605401e" = "Survived"
+
+["Module-Runtime with a guarded exit"]
+name = "Module-Runtime"
+version = "0.018"
+pathname = "H/HA/HAARG/Module-Runtime-0.018.tar.gz"
+sha256 = "0bf77ef68e53721914ff554eada20973596310b4e2cf1401fc958601807de577"
+shape = "a guarded exit during compilation that the upstream tests allow the tool to remove"
+build = []
+tests = ["prove", "-lr", "t"]
+options = ["--enable", "early-exit", "--mutant", "a69ddf608877"]
+
+["Module-Runtime with a guarded exit".expect]
+mutants = [1, 1]
+score = [0, 0]
+verdicts = { "a69ddf608877" = "Survived" }
+warnings = []
+seconds = 30

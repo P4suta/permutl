@@ -42,7 +42,11 @@ test("only protected main proposals and authentic merged drafts reach their own 
 	const install = prepare.steps.findIndex((s) => s.run?.includes("npm ci"));
 	assert.ok(install >= 0 && install < prepare.steps.indexOf(doppler));
 	assert.match(prepare.steps[install].run, /--ignore-scripts/);
-	assert.deepEqual(publish.permissions, { contents: "write", actions: "read" });
+	assert.deepEqual(publish.permissions, {
+		contents: "write",
+		actions: "read",
+		statuses: "read",
+	});
 	assert.equal(publish.uses, "./.github/workflows/publish-cpan.yml");
 	assert.match(publish.if, /github\.event_name == 'pull_request'/);
 	assert.match(publish.if, /needs\.prepare\.outputs\.release_id != ''/);

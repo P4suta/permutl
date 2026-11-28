@@ -86,6 +86,7 @@ subtest 'the summary of a part names the part and the size of the whole run' => 
     my %part = ( shard => '2/4', inventory => { mutants => 7, digest => 'ab' x 32 } );
     my $text =
       Test::Mutation::Report::Terminal::render( result( [ entry('Killed'), entry('Survived') ], %part ), color => 0 );
+    like $text, qr{\AScope: shard 2/4 of configured sources\n}, 'the heading identifies the measured shard';
     like $text, qr/^2 mutants: 1 killed, 1 survived\nPart 2 of 4 of a run with 7 mutants\.\nScore: /m,
       'the part follows the counts';
     unlike Test::Mutation::Report::Terminal::render( result( [ entry('Killed') ] ), color => 0 ), qr/^Part /m,

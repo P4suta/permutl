@@ -1,6 +1,7 @@
 package Test::Mutation::Syntax::PPI;
 use v5.36;
 use PPI;
+use PPIx::QuoteLike;
 use PPIx::Regexp;
 use Scalar::Util    qw(refaddr);
 use Types::Standard qw(ArrayRef Bool InstanceOf Int Maybe Optional Str Tuple);
@@ -10,12 +11,14 @@ use Test::Mutation::Mutator::Providers;
 use Test::Mutation::Site;
 use Test::Mutation::Suppression;
 use Test::Mutation::Syntax::Precedence;
+use Test::Mutation::Try;
 use Test::Mutation::Types qw(Analysis);
 
 our $VERSION = '0.001';
 
-my $TOKEN = InstanceOf ['PPI::Token'];
-my $BLOCK = InstanceOf ['PPI::Structure::Block'];
+my $TOKEN  = InstanceOf ['PPI::Token'];
+my $BLOCK  = InstanceOf ['PPI::Structure::Block'];
+my $NUMBER = InstanceOf ['PPI::Token::Number'];
 
 my %CONDITIONAL  = map { $_ => 1 } qw(if unless while until);
 my %MODIFIER     = map { $_ => 1 } qw(if unless while until for foreach);
@@ -43,6 +46,7 @@ my %CONTINUATION     = map { $_ => 1 } qw(elsif else continue catch finally);
 my %BODY_HEAD        = map { $_ => 1 } qw(method sub ADJUST);
 my %EXCLUDED_HEAD    = map { $_ => 1 } qw(use no package);
 my %HIDDEN_HEAD      = map { $_ => 1 } qw(field ADJUST);
+my %COMPILE_KEYWORD  = map { $_ => 1 } qw(use no BEGIN UNITCHECK CHECK INIT END);
 my %ROUTINE_HEAD     = map { $_ => 1 } qw(sub method);
 my %NEVER_A_CALL =
   map { $_ => 1 }
@@ -116,8 +120,8 @@ sub analyze ($source) {
         sites   => [],
         dropped => []
     };
-    $context->{values}  = _value_spans( $context, $document );
     $context->{misread} = _misread_readlines($document);
+    $context->{values}  = _value_spans( $context, $document );
     my $names = _names( $document, $context );
     _visit( $context, $document, 0 );
     my @sites    = sort { $a->start <=> $b->start || $a->end <=> $b->end } $context->{sites}->@*;
@@ -140,7 +144,7 @@ sub inside_begin ( $source, $offset ) {
     my $document = _document($text) or return 0;
     my $context  = { source => $source, text => $source->text, mark => $mark };
     for my $block ( @{ $document->find('PPI::Statement::Scheduled') || [] } ) {
-        next unless $block->first_token->content eq 'BEGIN';
+        next unless $block->type eq 'BEGIN';
         my $first = _offset( $context, $block->first_token );
         my $last  = _offset( $context, $block->last_token );
         return 1 if defined $first && defined $last && $first <= $offset && $offset <= $last;
@@ -148,18 +152,20 @@ sub inside_begin ( $source, $offset ) {
     return 0;
 }
 
-signature_for compile_reads =>
-  ( positional => [ Str, Optional [Bool] ], returns => Maybe [ ArrayRef [ Tuple [ Str, Str ] ] ] );
+my $COMPILE_DIRECTIVE = qr/\b(?:BEGIN|UNITCHECK|CHECK|use|no)\b/;
 
-sub compile_reads ( $source, $loaded = 0 ) {
-    return [] unless $loaded || $source =~ /\b(?:BEGIN|UNITCHECK|CHECK)\b/;
+signature_for compile_reads =>
+  ( positional => [ Str, Bool, { default => 0 } ], returns => Maybe [ ArrayRef [ Tuple [ Str, Str ] ] ] );
+
+sub compile_reads ( $source, $loaded ) {
+    return [] unless $loaded || $source =~ $COMPILE_DIRECTIVE;
     my $document = _document($source) or return;
     return if $loaded && !_fixed_module_load($document);
+    return if _embedded_phase($document);
     my @reads;
     for my $phase ( @{ $document->find('PPI::Statement::Scheduled') || [] } ) {
-        next unless $phase->first_token->content =~ /\A(?:BEGIN|UNITCHECK|CHECK)\z/;
-        my $body = $phase->schild(1);
-        return unless $body && $body->isa('PPI::Structure::Block');
+        next unless $phase->type =~ /\A(?:BEGIN|UNITCHECK|CHECK)\z/;
+        my $body = $phase->block or return;
         my %handles;
         for my $statement ( $body->schildren ) {
             my $text = join q{ }, map { $_->content } grep { $_->significant } $statement->tokens;
@@ -168,25 +174,107 @@ sub compile_reads ( $source, $loaded = 0 ) {
             return;
         }
     }
-    if ( $loaded || grep { $_->[0] eq 'env' } @reads ) {
+    if ( $loaded || @reads ) {
         return
           if grep { $_->type ne 'require' && !_fixed_import($_) } @{ $document->find('PPI::Statement::Include') || [] };
     }
     return \@reads;
 }
 
+sub _embedded_phase ($document) {
+    for my $token ( $document->tokens ) {
+        my $text = $token->isa('PPI::Token::HereDoc') ? join( q{}, $token->heredoc ) : $token->content;
+        next unless $text =~ $COMPILE_DIRECTIVE;
+        my $quoted = PPIx::QuoteLike->handles($token);
+        next unless $quoted || grep { $token->isa($_) } @REGEX_TOKEN;
+        my $parsed = _parsed_quote( $quoted ? 'PPIx::QuoteLike' : 'PPIx::Regexp', $token ) or return 1;
+        for my $part ( $quoted ? $parsed->children : $parsed->tokens ) {
+            next unless $part->can('ppi') && $part->content =~ $COMPILE_DIRECTIVE;
+            my $inner = $part->ppi or return 1;
+            return 1 if $inner->find_first( \&_embedded_keyword );
+            return 1 if _embedded_phase($inner);
+        }
+    }
+    return 0;
+}
+
+sub _embedded_keyword ( $document, $element ) {
+    return 0 unless _is_word( $element, \%COMPILE_KEYWORD );
+    my $subscript = $element->parent->parent;
+    return 1 unless ref $subscript eq 'PPI::Structure::Subscript';
+    my $key = join q{}, map { $_->content } grep { $_->significant } $subscript->tokens;
+    return $key ne '{' . $element->content . '}';
+}
+
 sub _fixed_module_load ($document) {
+    my $native_class = 0;
     for my $statement ( $document->schildren ) {
         if ( $statement->isa('PPI::Statement::Sub') ) {
             my $name = $statement->name || q{};
             return 0 if $name =~ /(?:\A|::) (?:import|unimport|AUTOLOAD|DESTROY) \z/x;
         }
-        next if $statement->isa('PPI::Statement::Include') && _fixed_import($statement);
+        if ( $statement->isa('PPI::Statement::Include') && _fixed_import($statement) ) {
+            $native_class = _class_feature( $statement, $native_class );
+            next;
+        }
         next unless _runs_at_load($statement);
+        next if $native_class && _fixed_class_load($statement);
         my @value = grep { !_is_semicolon($_) } $statement->schildren;
         return 0 unless @value == 1 && $value[0]->isa('PPI::Token::Number');
     }
     return 1;
+}
+
+sub _class_feature ( $statement, $enabled ) {
+    my $module = $statement->module || q{};
+    my $type   = $statement->type;
+    return 0 if !$module && $type eq 'use';
+    return $enabled unless $module eq 'feature' || $module eq 'experimental';
+    my @arguments = $statement->arguments;
+    my @features  = map { $_->literal }
+      grep { $_->isa('PPI::Token::Quote::Single') || $_->isa('PPI::Token::QuoteLike::Words') } @arguments;
+    return $type eq 'use' if grep { $_ eq 'class' } @features;
+    return 0 if $module eq 'feature' && $type eq 'no' && ( !@arguments || grep { $_ eq ':all' } @features );
+    return $enabled;
+}
+
+sub _fixed_class_load ($statement) {
+    for my $segment ( _segments( {}, $statement )->@* ) {
+        my @parts = grep { !_is_semicolon($_) } $segment->{children}->@*;
+        return 0 unless _fixed_class_segment(@parts);
+    }
+    return 1;
+}
+
+sub _fixed_class_segment ( $keyword = undef, $name = undef, @rest ) {
+    return 1 unless defined $keyword;
+    return 1 if $NUMBER->check($keyword) && !defined $name;
+    return 0 unless _is_word( $keyword, { class => 1 } ) && _is_name($name);
+    shift @rest if $NUMBER->check( $rest[0] );
+    my ($block) = @rest;
+    return 0 unless @rest == 1 && $BLOCK->check($block);
+
+    # PPI can group a compile-time directive with the method declared immediately before it.
+    return 0 if $block->find_first( sub ( $document, $element ) { _is_word( $element, \%COMPILE_KEYWORD ) } );
+    for my $member ( $block->schildren ) {
+        return 0 unless ref $member eq 'PPI::Statement';
+        for my $segment ( _segments( {}, $member )->@* ) {
+            my @parts = grep { !_is_semicolon($_) } $segment->{children}->@*;
+            return 0 if @parts && !_deferred_class_member(@parts);
+        }
+    }
+    return 1;
+}
+
+sub _deferred_class_member ( $keyword, $next = undef, @rest ) {
+    return 0 unless $next;
+    return 1 if _is_word( $keyword, { field => 1 } ) && $next->isa('PPI::Token::Symbol');
+    return 1 if _is_word( $keyword, { ADJUST => 1 } ) && $next->isa('PPI::Structure::Block') && !@rest;
+    return 0 unless _is_word( $keyword, { method => 1 } ) && _is_name($next);
+    return 0 if $next->content =~ /\A(?:import|unimport|AUTOLOAD|DESTROY)\z/;
+    return 1 unless @rest;
+    shift @rest if $rest[0]->isa('PPI::Structure::List');
+    return @rest == 1 && $rest[0]->isa('PPI::Structure::Block');
 }
 
 sub _fixed_import ($include) {
@@ -195,8 +283,10 @@ sub _fixed_import ($include) {
     my @arguments = $include->arguments;
     return 1 unless @arguments;
     return 1 if @arguments == 1 && $arguments[0]->isa('PPI::Structure::List') && !$arguments[0]->schild(0);
-    my $text = join q{}, map { $_->content } @arguments;
-    return 1 if $module eq 'lib' && $text =~ /\A\$ENV\{\s*[a-zA-Z_]\w*\s*\}\z/;
+    return 1 if $module eq 'constant' && ( join q{ }, map { $_->content } @arguments ) =~ /\A[a-zA-Z_]\w* => [0-9]+\z/;
+    my $text        = join q{}, map { $_->content } @arguments;
+    my $environment = qr{\$ENV\{\s*[a-zA-Z_]\w*\s*\}};
+    return 1 if $module eq 'lib' && $text =~ /\A$environment(?:,$environment)*\z/;
     return !grep {
              !_is_operator( $_, q{,} )
           && !$_->isa('PPI::Token::Quote::Single')
@@ -287,7 +377,7 @@ sub _value_spans ( $context, $document ) {
     my ($last)     = grep { _runs_at_load($_) } reverse @statements;
     my @values     = grep {
         ref $_ eq 'PPI::Statement'
-          && ( _is_value($_) || $last && refaddr($_) == refaddr($last) && _computed_value($_) )
+          && ( _is_value($_) || $last && refaddr($_) == refaddr($last) && _computed_value( $_, $context->{misread} ) )
     } @statements;
 
     # A statement whose place holds another text has no span, and it is among the places left out.
@@ -304,12 +394,12 @@ sub _runs_at_load ($statement) {
     return $statement->isa('PPI::Statement');
 }
 
-sub _computed_value ($statement) {
+sub _computed_value ( $statement, $readlines ) {
     my @parts = grep { !_is_semicolon($_) } $statement->schildren;
     if ( @parts == 1 && $parts[0]->isa('PPI::Structure::List') ) {
-        return scalar grep { _computed_value($_) } $parts[0]->schildren;
+        return scalar grep { _computed_value( $_, $readlines ) } $parts[0]->schildren;
     }
-    my $parsed = _parsed($statement);
+    my $parsed = _parsed( $statement, $readlines );
     my $end    = grep { $_->{kind} ne 'stop' } $parsed->{units}->@*;
     for my $at ( keys $parsed->{records}->@* ) {
         my $op = $parsed->{records}[$at] or next;
@@ -334,6 +424,7 @@ sub _is_literal ($element) {
 
 # PPI reads <$handle> in some places as two comparisons around a name.
 # No comparison lacks its right operand, so a ">" without one ends a readline, and the nearest "<" before it starts it.
+# The opening token counts the following siblings that form one operand.
 sub _misread_readlines ($document) {
     my %inside;
     my @ends = grep { $_->content eq '>' && _lacks_operand( scalar $_->snext_sibling ) }
@@ -343,7 +434,8 @@ sub _misread_readlines ($document) {
         my ($last)   = grep { refaddr $siblings[$_] == refaddr $end } 0 .. $#siblings;
         my ($first)  = grep { _starts_readline( $siblings[$_] ) } reverse 0 .. $last;
         next if !defined $first;
-        $inside{ refaddr $_ } = 1 for map { $_->isa('PPI::Token') ? $_ : $_->tokens } @siblings[ $first .. $last ];
+        $inside{ refaddr $_ } = 0 for map { $_->isa('PPI::Token') ? $_ : $_->tokens } @siblings[ $first .. $last ];
+        $inside{ refaddr $siblings[$first] } = $last - $first;
     }
     return \%inside;
 }
@@ -487,6 +579,9 @@ sub _visit ( $context, $element, $excluded ) {
         _token_site( $context, $element ) if !$excluded && $element->significant;
         return;
     }
+
+    # An anonymous subroutine can run after the enclosing import has finished.
+    $excluded = 0 if $excluded && _is_anonymous_body($element);
     if ( my $function = $context->{declarations}{ refaddr $element } ) {
         $function->{visible} = 1;
     }
@@ -497,11 +592,10 @@ sub _visit ( $context, $element, $excluded ) {
     _structure_sites( $context, $element ) if !$skip;
 
     # The name and the version of a package hold no behavior, and its block holds ordinary code.
-    # The body of an anonymous subroutine runs later, whatever statement holds it, such as a use of overload.
     my $package = $element->isa('PPI::Statement::Package');
     for my $child ( $element->children ) {
         my $apart = $skip || ( $package && !$child->isa('PPI::Structure::Block') );
-        _visit( $context, $child, _is_anonymous_body($child) ? 0 : $apart );
+        _visit( $context, $child, $apart );
     }
     return;
 }
@@ -679,12 +773,19 @@ sub _add ( $context, %site ) {
     return;
 }
 
+sub _parsed_quote ( $parser, $content ) {
+    my $parsed =
+      Test::Mutation::Try::attempt( sub { return $parser->new( $content, index_locations => 0 ) || 0 } )->{value};
+    return if !$parsed || $parsed->failures;
+    return $parsed;
+}
+
 sub _regex_sites ( $context, $token ) {
     my ( $start, $end ) = _span( $context, $token, $token ) or return;
     my $scope   = _scope( $context, $token ) or return;
     my $content = $token->content;
-    my $regex   = PPIx::Regexp->new($content);
-    my @parts   = $regex && !$regex->failures ? $regex->tokens : ();
+    my $regex   = _parsed_quote( 'PPIx::Regexp', $content );
+    my @parts   = $regex ? $regex->tokens : ();
     return _drop( $context, $token, 'regex', 'the pattern does not parse' )
       if join( q{}, map { $_->content } @parts ) ne $content;
 
@@ -753,7 +854,7 @@ sub _interpolated_index ($class) {
 }
 
 sub _token_site ( $context, $token ) {
-    return                                      if $context->{misread}{ refaddr $token };
+    return                                      if exists $context->{misread}{ refaddr $token };
     return _collection_site( $context, $token ) if $token->isa('PPI::Token::QuoteLike::Words') && $token->literal;
     return _regex_sites( $context, $token )     if grep { $token->isa($_) } @REGEX_TOKEN;
     return _operator_site( $context, $token )   if $token->isa('PPI::Token::Operator');
@@ -869,7 +970,7 @@ sub _operator_site ( $context, $token ) {
     return if refaddr( $place->{unit}{elements}[0] ) != refaddr $token;
     my ( $start, $end ) = _span( $context, $token, $place->{unit}{elements}[-1] ) or return;
     my $scope = _scope( $context, $token ) or return;
-    my ( $role, $facts ) = _operator_role($place);
+    my ( $role, $facts ) = _operator_role( $context, $place );
     if ( $BOUNDED_COMPARISON{ $token->content } ) {
         my $before = $token->sprevious_sibling;
         $facts->{implicit_call} = 1
@@ -930,16 +1031,20 @@ sub _guarded_exit_site ( $context, $token, $place, $scope ) {
 # The siblings of an element as the table of precedence reads them, each unit with its elements and its record.
 sub _place ( $context, $element ) {
     my $parent = $element->parent;
-    my $parsed = $context->{parsed}{ refaddr $parent } ||= _parsed($parent);
+    my $parsed = $context->{parsed}{ refaddr $parent } ||= _parsed( $parent, $context->{misread} );
     my $at     = $parsed->{index}{ refaddr $element };
     return { $parsed->%*, unit => $parsed->{units}[$at], record => $parsed->{records}[$at] };
 }
 
-sub _parsed ($parent) {
+sub _parsed ( $parent, $readlines ) {
     my @units;
     my @children = $parent->schildren;
     while (@children) {
-        my $child    = shift @children;
+        my $child = shift @children;
+        if ( my $following = $readlines->{ refaddr $child } ) {
+            push @units, { kind => 'term', text => q{}, elements => [ $child, splice @children, 0, $following ] };
+            next;
+        }
         my @elements = ($child);
         if (   _is_operator( $child, q{^} )
             && _is_operator( $children[0], q{^} )
@@ -963,7 +1068,7 @@ sub _parsed ($parent) {
     return { units => \@units, records => $records, index => \%index };
 }
 
-sub _operator_role ($place) {
+sub _operator_role ( $context, $place ) {
     my $content = $place->{unit}{text};
     return ( 'update', {} ) if $content eq '++' || $content eq '--';
 
@@ -981,9 +1086,55 @@ sub _operator_role ($place) {
     if ( !$record && $content eq q{*} ) {
         return ( 'unary', {} ) if $BLOCK->check( scalar $place->{unit}{elements}[0]->snext_sibling );
     }
+    return ( 'binary', { flip_flop => 1 } ) if $content eq '...' && _scalar_range( $context, $place );
     my $prefix = $record ? $record->{position} eq 'prefix' : $ALWAYS_PREFIX{$content};
     return ( 'unary',  {} ) if $prefix;
     return ( 'binary', { _right_number($place)->%*, _version_literal($place) } );
+}
+
+sub _scalar_range ( $context, $place ) {
+    my $record = $place->{record};
+    return 0 unless $record && $record->{before} && $record->{after};
+    my $first = $place->{units}[ $record->{before}[0] ]{elements}[0];
+    my $last  = $place->{units}[ $record->{after}[1] - 1 ]{elements}[-1];
+    while (1) {
+        my ( $previous, $next ) = ( $first->sprevious_sibling, $last->snext_sibling );
+        return 1 if _tested_range( $context, $first, $next ) || _scalar_assignment($previous);
+        last     if $next && !_is_semicolon($next);
+        return 1 if _is_word( $previous, \%CONDITIONAL );
+        last     if $previous;
+        my $parent = $first->parent->parent;
+        return !_is_operator( scalar $parent->sprevious_sibling->sprevious_sibling, '->' )
+          if $parent->isa('PPI::Structure::Condition');
+        return _scalar_block_result( $first->parent, $parent ) if $parent->isa('PPI::Structure::Block');
+        last unless $parent->isa('PPI::Structure::List');
+        my $prefix = $parent->sprevious_sibling;
+        return !_is_operator( scalar $prefix->sprevious_sibling, '->' )
+          if _is_word( $prefix, { scalar => 1, 'CORE::scalar' => 1 } );
+        last if $prefix && ( !$prefix->isa('PPI::Token::Operator') || _is_operator( $prefix, '->' ) );
+        $first = $last = $parent;
+    }
+    return 0;
+}
+
+sub _tested_range ( $context, $first, $following ) {
+    return 0 unless _is_operator( $following, q{?}, qw(or and xor) );
+    my $consumer = _place( $context, $following );
+    my $operand  = $consumer->{record}{before};
+    return $operand && $operand->[0] == $consumer->{index}{ refaddr $first };
+}
+
+sub _scalar_assignment ($operator) {
+    return 0 unless _is_operator( $operator, '=' );
+    my $target = $operator->sprevious_sibling;
+    return $target && $target->isa('PPI::Token::Symbol') && $target->raw_type eq '$';
+}
+
+sub _scalar_block_result ( $statement, $block ) {
+    return 0 if $statement->snext_sibling;
+    my $word = $block->sprevious_sibling;
+    return _is_word( $word, { grep => 1, sort => 1, 'CORE::grep' => 1, 'CORE::sort' => 1 } )
+      && !_is_operator( scalar $word->sprevious_sibling, '->' );
 }
 
 # The element of an operand that is one element alone.
@@ -1267,6 +1418,7 @@ sub _statement_site ( $context, $segment ) {
     my $scope    = _segment_scope($segment);
     my @tokens   = map { $_->isa('PPI::Token') ? $_ : $_->tokens } @children;
     my $declares = _declares_for_later( $children[0]->parent, \@tokens );
+    my $anchored = $children[0]->isa('PPI::Token::Word') || _is_operator( $children[0], '...' );
     _add(
         $context,
         kind  => 'statement',
@@ -1275,8 +1427,8 @@ sub _statement_site ( $context, $segment ) {
         scope => $scope,
         facts => {
             head => $children[0]->isa('PPI::Token::Word') ? $children[0]->content : q{},
-            $children[0]->isa('PPI::Token::Word') ? _anchors( $context, $children[0] ) : (),
-            $declares                             ? ( declares => 1 )                  : ()
+            $anchored ? _anchors( $context, $children[0] ) : (),
+            $declares ? ( declares => 1 )                  : ()
         },
     );
     return;

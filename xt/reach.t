@@ -143,9 +143,9 @@ is [ sort keys $distribution->{on}->%* ], [qw(workflow_call workflow_dispatch)],
 my @mac     = grep { $_->{'runs-on'} =~ /\Amacos-/ } values $distribution->{jobs}->%*;
 my @install = grep {
     my %steps = map { $_->{run} => 1 } grep { defined $_->{run} } $_->{steps}->@*;
-    $steps{'mise run dist'} && $steps{'mise x -- make disttest'}
+    $steps{'mise run dist'} && $steps{'mise run verify-install'}
 } @mac;
-ok scalar @install, 'a macOS job builds and tests the unpacked distribution';
+ok scalar @install, 'a macOS job builds and installs the distribution';
 
 my @driver_commands = map { defined $_->{run} ? $_->{run} : () } $workflow->{jobs}{driver}{steps}->@*;
 my $driver          = proves(@driver_commands);

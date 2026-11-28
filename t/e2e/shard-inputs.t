@@ -3,7 +3,7 @@ use Test2::V0;
 use Cwd        ();
 use File::Temp ();
 use lib 't/e2e/lib';
-use Fixture qw(run_fixture write_file);
+use Fixture qw(run_fixture with_driver_shims write_file);
 use Test::Mutation::Merge;
 use Test::Mutation::Report::Json;
 use Test::Mutation::Runner;
@@ -54,6 +54,20 @@ sub compare (%settings) {
 }
 
 ok lives { compare( cache => 1, jobs => 1 ) }, 'cached and uncached observations use compatible inputs';
+subtest 'shards can use independently formatted configuration files' => sub {
+    my @parts;
+    for my $part ( 1 .. 2 ) {
+        my $checkout = "configured-$part";
+        my $root     = "$area/$checkout";
+        write_file( "$root/lib/Boundary.pm", $module );
+        write_file( "$root/t/boundary.t",    "use Test::More tests => 1; use Boundary; ok Boundary::positive(1);\n" );
+        write_file( "$root/settings.toml",   "# Settings for worker $part\njobs = $part\n" );
+        push @parts, shard( $checkout, $part, config => 'settings.toml' );
+    }
+    ok lives { Test::Mutation::Merge::merge( \@parts ) },
+      'the selected measurement settings determine whether the shards can be combined';
+};
+
 ok lives { Test::Mutation::Merge::merge( [ checkout_library( 'first', 1 ), checkout_library( 'second', 2 ) ] ) },
   'checkout-relative Perl search paths identify identical project libraries';
 {
@@ -61,7 +75,11 @@ ok lives { Test::Mutation::Merge::merge( [ checkout_library( 'first', 1 ), check
     for my $number ( 1 .. 2 ) {
         my $root   = "$area/" . ( $number == 1 ? 'first' : 'second' );
         my $config = Test::Mutation::Settings::of_call( { root => $root, shard => "$number/2", cache => $number - 1 } );
-        my $result = Test::Mutation::Runner::run( $config, sub { }, { paths => { 'lib/Boundary.pm' => [] } } );
+        my $result = with_driver_shims(
+            sub {
+                Test::Mutation::Runner::run( $config, sub { }, { paths => { 'lib/Boundary.pm' => [] } } );
+            }
+        );
         push @parts, { name => "$number", result => $result };
     }
     ok lives { Test::Mutation::Merge::merge( \@parts ) }, 'both cache modes identify the same file selection';
@@ -182,20 +200,26 @@ PERL
     for my $checkout (qw(data-first data-second)) {
         write_file( "$area/$checkout/lib/Idle.pm", $idle );
     }
-    my $opaque = shard( 'data-first',  1, cache => 1 );
+    my $opaque = shard( 'data-first',  1, cache => 1, jobs => 1 );
     my $peer   = shard( 'data-second', 2, cache => 1 );
-    is $opaque->{result}->compiler_inputs, $peer->{result}->compiler_inputs,
-      'an unchanged opaque source has the same compilation in both checkouts';
+    is $opaque->{result}->stats->{compiles}, 1, 'an unbound original needs no mutant compilations';
+    unlike join( "\n", $opaque->{result}->warnings->@* ), qr/no stable text/,
+      'a repeatable compilation with an unknown input has no unstable-output warning';
+    is $opaque->{result}->measurement_digest, undef, 'an unidentified input leaves the measurement uncertified';
     ok !( grep { defined $_->{compiled_digest} } $peer->{result}->entries->@* ),
       'an indirect compiler input leaves the observed test verdict in place';
     ok + ( grep { $_->{status} eq 'NoCoverage' } $peer->{result}->entries->@* ),
       'the untouched target keeps its actual lack of test coverage';
-    ok lives { Test::Mutation::Merge::merge( [ $opaque, $peer ] ) }, 'equal observations from opaque sources can merge';
+    like dies { Test::Mutation::Merge::merge( [ $opaque, $peer ] ) }, qr/measurement inputs are missing/,
+      'identical deparses cannot identify an opaque input';
+    my @unchecked = map { shard( "data-$_->[0]", $_->[1], equivalence => 0 ) } [ first => 1 ], [ second => 2 ];
+    like dies { Test::Mutation::Merge::merge( \@unchecked ) }, qr/measurement inputs are missing/,
+      'unidentified compiler inputs prevent a merge without observed deparsed code';
     write_file( "$area/limit", "11\n" );
     my $changed = shard( 'data-second', 2, cache => 1 );
     is $changed->{result}->reused, 0, 'a source with opaque compiler reads is measured again';
-    like dies { Test::Mutation::Merge::merge( [ $opaque, $changed ] ) }, qr/measurement inputs differ/,
-      'different observed compilations of one opaque source reject the merge';
+    like dies { Test::Mutation::Merge::merge( [ $opaque, $changed ] ) }, qr/measurement inputs are missing/,
+      'the changed opaque source still lacks input evidence';
 };
 
 subtest 'loaded modules cannot replace the input that a phase block read' => sub {
@@ -236,30 +260,32 @@ PERL
     my $peer  = shard( 'bound-second', 2, cache => 1 );
     ok !( grep { defined $_->{compiled_digest} } $peer->{result}->entries->@* ),
       'the final path does not prove which file was read';
-    ok lives { Test::Mutation::Merge::merge( [ $prior, $peer ] ) }, 'identical observed compilations still merge';
+    like dies { Test::Mutation::Merge::merge( [ $prior, $peer ] ) }, qr/measurement inputs are missing/,
+      'the unverified final binding cannot certify the shards';
     write_file( "$area/before.dat", "13\n" );
     my $warm = shard( 'bound-second', 2, cache => 1 );
     is $warm->{result}->reused, 0, 'the path assigned after the read cannot validate a prior verdict';
-    like dies { Test::Mutation::Merge::merge( [ $prior, $warm ] ) }, qr/measurement inputs differ/,
-      'different values read before the path changes reject the merge';
+    like dies { Test::Mutation::Merge::merge( [ $prior, $warm ] ) }, qr/measurement inputs are missing/,
+      'shards with a reassigned binding cannot supply the missing input';
 
     local $ENV{TEST_PROJECT_ORIGINAL} = $ENV{TEST_PROJECT_TABLE};
     write_file( "$area/rebind-library/SwitchInput.pm",
-        'package SwitchInput; $ENV{TEST_PROJECT_TABLE} = $ENV{TEST_PROJECT_LATER}; 1;' );
-    write_file( $rebind, 'package Rebind; $ENV{TEST_PROJECT_TABLE} = $ENV{TEST_PROJECT_ORIGINAL}; 1;' );
+        'package SwitchInput; sub choose { $ENV{TEST_PROJECT_TABLE} = $ENV{TEST_PROJECT_LATER} } choose; 1;' );
+    write_file( $rebind,
+        'package Rebind; sub restore { $ENV{TEST_PROJECT_TABLE} = $ENV{TEST_PROJECT_ORIGINAL} } restore; 1;' );
     my $switched = $reader =~ s/^BEGIN/use SwitchInput;\nBEGIN/mr;
     write_file( "$area/$_/lib/Idle.pm", $switched ) for qw(bound-first bound-second);
     my $before_restore = shard( 'bound-first',  1, cache => 1 );
     my $restored       = shard( 'bound-second', 2, cache => 1 );
     ok !( grep { defined $_->{compiled_digest} } $restored->{result}->entries->@* ),
       'restoring the original path cannot prove which file an intervening read used';
-    ok lives { Test::Mutation::Merge::merge( [ $before_restore, $restored ] ) },
-      'equal observed compilations survive a temporary change';
+    like dies { Test::Mutation::Merge::merge( [ $before_restore, $restored ] ) }, qr/measurement inputs are missing/,
+      'an unobserved intermediate binding prevents merging';
     write_file( "$area/after.dat", "17\n" );
     my $changed = shard( 'bound-second', 2, cache => 1 );
     is $changed->{result}->reused, 0, 'the restored path cannot validate results for the intermediate file';
-    like dies { Test::Mutation::Merge::merge( [ $before_restore, $changed ] ) }, qr/measurement inputs differ/,
-      'changing the intermediate file rejects the merge';
+    like dies { Test::Mutation::Merge::merge( [ $before_restore, $changed ] ) }, qr/measurement inputs are missing/,
+      'changing the intermediate file cannot validate the missing input';
 };
 
 subtest 'a library loaded by the compiler reads an external data file' => sub {
@@ -288,6 +314,14 @@ PERL
     write_file( "$area/$_/lib/Idle.pm",           $idle ) for qw(idle-first idle-second);
     write_file( "$area/imported-limit",           "3\n" );
     write_file( "$area/data-library/Defaults.pm", "package Defaults; sub count () { 3 } 1;\n" );
+    my $check_only = "#!$^X\n" . <<'PERL';
+die "unexpected deparse\n" if grep { $_ eq '-MO=Deparse' } @ARGV;
+exec {$^X} $^X, @ARGV or die $!;
+PERL
+
+    for my $checkout (qw(idle-first idle-second)) {
+        chmod 0755, write_file( "$area/$checkout/tools/check-perl", $check_only ) or die $!;
+    }
     my $simple = shard( 'idle-second', 2 );
     write_file( "$area/data-library/Defaults.pm", $defaults );
     my $prior = shard( 'idle-first',  1, cache => 1 );
@@ -298,13 +332,46 @@ PERL
       'only the original needs a second compilation to bind the imported read';
     ok lives { Test::Mutation::Merge::merge( [ $prior, $other ] ) }, 'identical imported constants can merge';
     ok shard( 'idle-second', 2, cache => 1 )->{result}->reused > 0,  'an unchanged imported data file permits reuse';
+    my %syntax = ( equivalence => 0, cache => 1, perl => 'tools/check-perl' );
+    my $seen   = shard( 'idle-first',  1, %syntax );
+    my $next   = shard( 'idle-second', 2, %syntax );
+    ok lives { Test::Mutation::Merge::merge( [ $seen, $next ] ) },
+      'known equal compiler inputs merge without deparsing';
+    ok shard( 'idle-second', 2, %syntax )->{result}->reused > 0, 'a syntax-only observation validates cached verdicts';
     write_file( "$area/imported-limit", "9\n" );
+    my $checked = shard( 'idle-second', 2, %syntax );
+    is $checked->{result}->reused, 0, 'a syntax-only cache checks the changed input before reuse';
+    like dies { Test::Mutation::Merge::merge( [ $seen, $checked ] ) }, qr/measurement inputs differ/,
+      'changed compiler inputs cannot merge when equivalence is disabled';
     my $warm = shard( 'idle-second', 2, cache => 1 );
     is $warm->{result}->reused, 0, 'a warm run verifies data read from a compiler dependency';
     like dies { Test::Mutation::Merge::merge( [ $prior, $warm ] ) }, qr/measurement inputs differ/,
       'changed data behind an imported constant rejects a cached shard';
     like dies { Test::Mutation::Merge::merge( [ $prior, shard( 'idle-second', 2 ) ] ) }, qr/measurement inputs differ/,
       'changed data behind an imported constant rejects a fresh shard';
+
+    my $indirect = $defaults =~ s/\$ENV\{TEST_PROJECT_TABLE\}/table()/r;
+    $indirect =~ s/^BEGIN/sub table { return \$ENV{TEST_PROJECT_TABLE} }\nBEGIN/m;
+    write_file( "$area/data-library/Defaults.pm", $indirect );
+    my $before = shard( 'idle-first', 1 );
+    ok !( grep { defined $_->{compiled_digest} } $before->{result}->entries->@* ),
+      'the unresolved imported read keeps the mutant fingerprints out of comparisons';
+    like dies { Test::Mutation::Merge::merge( [ $before, shard( 'idle-second', 2 ) ] ) },
+      qr/measurement inputs are missing/, 'an indirect imported read needs a verified input even for equal constants';
+    write_file( "$area/imported-limit", "13\n" );
+    like dies { Test::Mutation::Merge::merge( [ $before, shard( 'idle-second', 2 ) ] ) },
+      qr/measurement inputs are missing/, 'a changed constant cannot certify an unidentified imported input';
+    write_file( "$area/data-library/Defaults.pm", $defaults );
+    write_file( "$area/idle-first/lib/Idle.pm", $idle =~ s/use Defaults;/use ApplicationContext ();\nuse Defaults;/r );
+    write_file( "$area/idle-first/t/pass.t",    <<'PERL' );
+use Test::More tests => 1;
+BEGIN { $INC{'ApplicationContext.pm'} = __FILE__ }
+use Idle;
+ok Idle::small(1);
+PERL
+    my $incomplete = shard( 'idle-first', 1, %syntax )->{result};
+    is $incomplete->baseline_failures,  [],    'the test supplies the application context required to load the source';
+    is $incomplete->measurement_digest, undef, 'a failed syntax check cannot certify a partial compiler input record';
 };
 
 my $wrapped = shard( 'first', 1, perl => 'tools/perl' );

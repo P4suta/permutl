@@ -1230,6 +1230,9 @@ A signal ended the command before its work was done.
 
 =head1 MUTATORS
 
+Use C<--enable early-exit> to test guarded transfers of control with the default profile.
+C<--enable @removal> selects it with the other removal mutators.
+
 =for generated MUTATORS
 
 =over 4
@@ -1307,7 +1310,7 @@ The C<default> profile includes the mutator.
 =item C<early-exit>
 
 Removes a guarded transfer of control.
-The C<default> profile includes the mutator.
+The C<extended> profile includes the mutator.
 
 =item C<filter-negation>
 
@@ -1386,7 +1389,7 @@ The C<extended> profile includes the mutator.
 
 =item C<range-boundary>
 
-Lowers the upper bound of a range by one.
+Moves the endpoint of a range or flip-flop.
 The C<extended> profile includes the mutator.
 
 =item C<regex-anchor>

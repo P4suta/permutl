@@ -28,6 +28,7 @@ jobs:
     permissions:
       actions: read  # Verify the run and immutable artifact.
       contents: read  # Check the selected source and distribution.
+      statuses: read  # Let the release gate verify local checks.
     # GitHub resolves the reusable workflow at the caller's commit.
     uses: ./.github/workflows/release-gate.yml  # zizmor: ignore[self-repository]
     with:

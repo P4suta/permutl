@@ -27,7 +27,9 @@ is $api->assessment->{exitCode}, 1, 'the missed change fails the requested thres
 is [ map { [ $_->{mutant}->id, $_->{status} ] } $api->entries->@* ], [ [ $id, 'Survived' ] ],
   'the Perl API measures the same remaining gap';
 write_file( "$project/t/positive.t", "use Test::More tests => 1;\nuse Totals;\nis Totals::sum(4, 1), 5;\n" );
-ran( 0, $project, 'run', '--undetected', @options, '--format', 'json', '--min-score', 100 );
+my $recheck = ran( 0, $project, 'run', '--undetected', @options, '--format', 'json', '--min-score', 100 );
+like $recheck->{stdout}, qr/^Scope: previously undetected mutants\nUndetected: 0$/m,
+  'the terminal report identifies the rechecked mutants and shows that the gap closed';
 my $result =
   Test::Mutation::Report::Json::parse( Test::Mutation::Source::read_bytes("$project/mutation-report/mutation.json") );
 is [ map { [ $_->{mutant}->id, $_->{status}, $_->{by}, $_->{tests_run} ] } $result->entries->@* ],

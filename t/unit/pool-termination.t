@@ -61,6 +61,21 @@ sub pooled ( $clock, $jobs, $tasks, $done = sub (@) { return } ) {
 
 my $QUICK = qq{print "1..1\\nok 1\\n";\n};
 
+subtest 'an idle pool saves ready checkpoints before requesting work' => sub {
+    my @calls;
+    my $clock = ManualClock->new( limit => 0 );
+    my $count = Test::Mutation::Pool::run(
+        jobs        => 1,
+        clock       => $clock,
+        work        => {},
+        checkpoints => [ sub ($may_wait) { push @calls, $may_wait ? 'save' : 'try'; return 1 } ],
+        next        => sub { push @calls, 'next'; return },
+        done        => sub { die 'unexpected test completion' },
+    );
+    is $count,  0,               'no child process ran';
+    is \@calls, [qw(save next)], 'the saved result is available before the next work request';
+};
+
 subtest 'tasks, follow-up tasks, and an empty queue end' => sub {
     my @quick = map { script( "quick-$_.t", $QUICK ) } 1 .. 3;
     my $later = script( 'later.t', $QUICK );
@@ -72,6 +87,29 @@ subtest 'tasks, follow-up tasks, and an empty queue end' => sub {
     is $run->{work}, { spawns => 4 },                          'the pool counts a process for each task and lists none';
 
     is pooled( ManualClock->new, 3, [] ), { count => 0, results => {}, work => {} }, 'an empty queue ends at once';
+};
+
+subtest 'a follow-up shares the available slots with newly ready work' => sub {
+    my $quick = script( 'follow-and-fill.t', $QUICK );
+    my @ready = ( task($quick) );
+    my ( %work, $follow, $started );
+    my $clock =
+      ManualClock->new( steps => [ sub (@) { return 0 unless $follow; $started = $work{spawns}; return 1 } ], );
+    my $count = Test::Mutation::Pool::run(
+        jobs             => 2,
+        clock            => $clock,
+        work             => \%work,
+        retry_after_done => 1,
+        next             => sub { shift @ready },
+        done             => sub (@) {
+            return if $follow;
+            $follow = 1;
+            push @ready, task($quick);
+            return task($quick);
+        },
+    );
+    is $count,   3, 'the original, follow-up, and independent tasks finished';
+    is $started, 3, 'both free slots started work before the pool waited';
 };
 
 subtest 'each cause ends a test that would not end' => sub {

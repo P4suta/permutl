@@ -62,6 +62,31 @@ ok !defined compile_record(
   ),
   'an initially unavailable operand cannot acquire evidence later in compilation';
 
+my $initial_setting = write_file( "$root/directory-setting", 'initial' );
+write_file( "$root/changed/directory-setting", 'changed' );
+write_file( "$root/probe.pl",                  <<'PERL' );
+BEGIN {
+    chdir 'changed' or die "enter changed directory: $!";
+    open my $in, '<', $ENV{COMPILER_CONFIG} or die "open setting: $!";
+    die "wrong setting" unless <$in> eq $ENV{EXPECTED_SETTING};
+}
+PERL
+my %unchanged = map { $_ => 1 } @{
+    compile_record(
+        $root, 'absolute-setting', $named,
+        COMPILER_CONFIG  => $initial_setting,
+        EXPECTED_SETTING => 'initial'
+      )
+      || []
+};
+ok $unchanged{ unpack 'H*', $initial_setting }, 'an absolute setting survives a compiler directory change';
+ok !defined compile_record(
+    $root, 'relative-setting', $named,
+    COMPILER_CONFIG  => 'directory-setting',
+    EXPECTED_SETTING => 'changed'
+  ),
+  'an unchanged environment value can name a different file after the compiler changes its directory';
+
 write_file( "$root/probe.pl", <<'PERL' );
 BEGIN {
     if (open my $optional, '<', $ENV{COMPILER_CONFIG}) {

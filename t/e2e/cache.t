@@ -19,6 +19,22 @@ sub append ( $path, $text ) {
     return;
 }
 
+subtest 'a new compiler input protocol rechecks the original tests and their verdicts' => sub {
+    my $project = copy_of('calc');
+    {
+        no warnings qw(once redefine);
+        local *Test::Mutation::Result::supported_compiler_input_protocol = sub { return 1 };
+        my ($earlier) = run_fixture($project);
+        is $earlier->compiler_input_protocol, 1, 'the earlier measurement uses its own compiler rules';
+    }
+    my ($current) = run_fixture($project);
+    is $current->stats->{baseline_tests}, scalar $first->tests->@*, 'the current rules measure every original test';
+    is $current->reused,   0,                'the previous protocol supplies no reusable verdicts';
+    is statuses($current), statuses($first), 'remeasurement preserves the independently verified verdicts';
+    my ($again) = run_fixture($project);
+    is $again->reused, $measured, 'a second run with the current rules reuses the fresh observations';
+};
+
 subtest 'a legacy cache reuses only independently verifiable observations' => sub {
     my $directory = "$root/.mutation";
     my $database  = "$directory/measurement.sqlite";
@@ -96,6 +112,29 @@ subtest 'ignored survivors keep their statuses and reasons in a reused run' => s
       [ map { [ $_->@{qw(reason detail)} ] } $before->entries->@* ], 'the reasons and the details are unchanged';
     is scalar( grep { $_->{status} eq 'Ignored' } $after->entries->@* ), 2,  'both ignored mutants stay ignored';
     is $after->reused,                                                   10, 'every result comes from the cache';
+};
+
+subtest 'changing whether Perl can compare a mutant invalidates its old equivalence verdict' => sub {
+    my $project    = copy_of('equivalent');
+    my ($before)   = run_fixture( $project, cache => 1 );
+    my ($ignored)  = grep { defined $_->{reason} && $_->{reason} eq 'same-code-as-original' } $before->entries->@*;
+    my $id         = $ignored->{mutant}->id;
+    my $comparable = Test::Mutation::Mutant->can('comparable');
+    my $sample     = Test::Mutation::Store->can('sample');
+    no warnings 'redefine';
+    local *Test::Mutation::Mutant::comparable = sub ($mutant) {
+        return $mutant->id eq $id ? 0 : $comparable->($mutant);
+    };
+    local *Test::Mutation::Store::sample = sub ( $ids, $seed ) {
+        return $sample->( [ grep { $_ ne $id } @$ids ], $seed );
+    };
+    my ($fresh)    = run_fixture( $project, cache => 0 );
+    my ($warm)     = run_fixture( $project, cache => 1 );
+    my ($observed) = grep { $_->{mutant}->id eq $id } $fresh->entries->@*;
+    is $observed->{status}, 'Survived',   'the current candidate must be judged by the tests';
+    is statuses($warm), statuses($fresh), 'the stored result agrees without waiting to sample the changed candidate';
+    my @unchanged = grep { $_->{mutant}->id ne $id } $before->entries->@*;
+    is $warm->reused, scalar @unchanged, 'the other candidate observations still qualify for reuse';
 };
 
 subtest 'a changed source without a mutant of its own invalidates the tests that load it' => sub {

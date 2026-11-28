@@ -6,11 +6,38 @@ For example, Git tag `v0.1.0` corresponds to Perl version `0.001` and the archiv
 After the merge, the workflow checks the release commit and submits the verified archive to the Perl Authors Upload Server (PAUSE).
 It compares the bytes on the Comprehensive Perl Archive Network (CPAN) with the verified archive before publishing the GitHub draft.
 
+## Check a branch before pushing
+
+From a clean checkout, run `mise run check-ci`.
+The command runs the fast checks on the pinned Perl and repeats the pull request's driver and shim tests in Linux containers.
+
 ## Check the candidate before merging
 
-With GitHub Actions access, run the credential check from `main`.
-Run the release gate with the full 40-character candidate commit and its expected Perl version.
-Review both runs before deciding whether to merge.
+Use a separate checkout for the release proposal so you can continue working during the local checks.
+The local release gate checks the whole mutation inventory, test coverage, supported interpreters, and real Perl distributions.
+The gate builds the archive, runs `make disttest`, and tests a fresh installation.
+
+```sh
+git fetch origin release-please--branches--main
+candidate_sha=$(git rev-parse FETCH_HEAD)
+git worktree add --detach ../Test-Mutation-release "$candidate_sha"
+cd ../Test-Mutation-release
+mise trust
+mise run setup
+mise run record-release-check
+```
+
+To shorten the measurement, set `TEST_MUTATION_DETECTOR_DIR` to a directory outside the checkout containing earlier JSON reports.
+The current measurement runs every original test and checks every mutant.
+An earlier detection can only suggest which covering test to try first.
+The gate prefers an exact mutant ID.
+If an edit moves a mutant, the gate matches its span, mutator, and replacement within unchanged source lines.
+The matching text includes up to two lines on each side and must occur once in each version of the same file.
+
+The recording task sets the `release/local` commit status using your GitHub CLI account.
+GitHub verifies that the repository account recorded the status and installs the archive on Linux and macOS.
+A release proposal with changed content needs a fresh local check.
+Run the hosted checks with the candidate commit and its expected Perl version before merging.
 
 ```sh
 gh workflow run release-credentials.yml --ref main

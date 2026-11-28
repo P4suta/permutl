@@ -3,7 +3,7 @@ use Test2::V0;
 use lib 't/e2e/lib';
 use Cwd        ();
 use File::Temp ();
-use Fixture    qw(copy_of ran ran_from tree_digest write_file);
+use Fixture    qw(copy_of ran ran_from tree_digest with_driver_shims write_file);
 use Test::Mutation::Mutator::Catalog;
 use Test::Mutation::Runner;
 use Test::Mutation::Settings;
@@ -50,7 +50,11 @@ subtest 'baseline runs the unmodified tests without mutating or replacing a repo
     my $later = ran( 0, $project, 'list', 'lib/Other.pm' )->{stdout};
     like $later,   qr/lib\/Other[.]pm:2:\d+\s+arithmetic/, 'a source following an unselected file is listed';
     unlike $later, qr/lib\/Calc[.]pm/,                     'the unselected source stays out of the listing';
-    my $baseline = Test::Mutation::Runner::run( $config, sub { }, { baseline_only => 1 } );
+    my $baseline = with_driver_shims(
+        sub {
+            Test::Mutation::Runner::run( $config, sub { }, { baseline_only => 1 } );
+        }
+    );
     is [ sort keys $baseline->sources->%* ], [qw(lib/Calc.pm lib/Other.pm)],
       'the unmodified run records every source even when the project has several files';
     is $baseline->entries, [], 'a baseline produces no mutant entries';

@@ -75,6 +75,7 @@ A test reaches the site when it runs a line in this range.
 What the analysis learned about the span beyond its text, in the shape of L<Test::Mutation::Types/Facts>.
 C<right> holds the number that is the whole right operand of an arithmetic operator, as L<Test::Mutation::Syntax::Precedence> bounds the operand.
 C<operand> names the kind of the operand after a binding operator.
+C<flip_flop> marks a three-dot range in a known scalar context.
 C<branches> holds where the two branches of a conditional stand inside the span, and C<anchors> the places of the tokens that name a wider construct.
 C<operands> gives the end of the left operand and the start of the right operand in a three-way comparison.
 C<has_argument> marks a call with an explicit operand.

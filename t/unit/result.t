@@ -50,6 +50,18 @@ sub result ( $statuses, %fields ) {
     );
 }
 
+subtest 'the supported compiler input protocol identifies which digest a reader can verify' => sub {
+    my $protocol = Test::Mutation::Result::supported_compiler_input_protocol();
+    isa_ok dies { Test::Mutation::Result::supported_compiler_input_protocol('extra') }, ['Error::TypeTiny'],
+      'the protocol depends only on the installed driver';
+    my $digest = 'ac' x 32;
+    is result( [], measurement_digest => $digest )->verified_measurement_digest, $digest,
+      'the current protocol verifies the measured inputs';
+    my $future = result( [], compiler_input_protocol => $protocol + 1, measurement_digest => $digest );
+    is $future->measurement_digest,          $digest, 'a reader can display a digest written by a newer driver';
+    is $future->verified_measurement_digest, undef,   'unknown compiler rules cannot verify the inputs';
+};
+
 subtest 'tally' => sub {
     my $tally = result( [qw(Killed Killed Survived Timeout)] )->tally;
     is $tally->{counts}{Killed}, 2, 'killed';
@@ -59,6 +71,8 @@ subtest 'tally' => sub {
 
 subtest 'the public assessment applies the threshold to this scope' => sub {
     my $report = result( [qw(Killed Survived)], min_score => 75 );
+    isa_ok dies { Test::Mutation::Outcome::assessment( $report, 'unavailable' ) }, ['Error::TypeTiny'],
+      'an assessment rejects a nonnumeric minimum score';
     is $report->assessment,
       { $report->tally->%*, minimum => 75, outcome => 'measured', gate => 'failed', exitCode => 1 },
       'the API includes the same tally and exit status as the command';
@@ -104,10 +118,16 @@ subtest 'a cached disagreement or an unanalyzed source makes a scored run inconc
                 cache_mismatch => $mismatch,
                 problems       => $unparsed ? [ { path => 'lib/Incomplete.pm', problem => 'unreadable source' } ] : []
             );
+            my $tally = Test::Mutation::Result->can('tally');
+            my $calls = 0;
+            no warnings 'redefine';
+            local *Test::Mutation::Result::tally = sub ($self) { $calls++; return $tally->($self) };
             my $decision = Test::Mutation::Outcome::of( $report, 0 );
             is [ $decision->{name}, $decision->{exit}->name ],
               $mismatch || $unparsed ? [qw(inconclusive inconclusive)] : [qw(measured success)],
               "cache mismatch $mismatch and source problem $unparsed decide the whole measurement";
+            is $calls, $mismatch || $unparsed ? 0 : 1,
+              "cache mismatch $mismatch and source problem $unparsed determine whether a score is needed";
         }
     }
 };

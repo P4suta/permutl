@@ -5,10 +5,11 @@ use Errno          ();
 use File::Spec     ();
 use File::Basename ();
 use File::Temp     ();
-use Fcntl          qw(O_RDONLY LOCK_EX S_ISREG);
+use Fcntl          qw(O_RDONLY LOCK_EX SEEK_END S_ISREG);
 use List::Util     ();
 use Scalar::Util   ();
 use Time::HiRes    ();
+use IO::File       ();
 use IO::Handle     ();
 use Types::Standard
   qw(ArrayRef Bool CodeRef Dict Enum FileHandle GlobRef HashRef InstanceOf Int Maybe Optional Slurpy Str);
@@ -61,20 +62,25 @@ my %COMMAND = (
 );
 
 signature_for main => ( positional => [ Slurpy [ ArrayRef [Str] ] ], returns => Int );
+signature_for main_with_detector_hints => (
+    positional => [ HashRef [Str], Slurpy [ ArrayRef [Str] ] ],
+    returns    => Int,
+);
 
 # A standard stream of the process may be closed, and the command still ends with a status.
 my $STREAM = FileHandle | GlobRef;
 
 # The facts that the command reads from its process, so that a caller may give other ones.
 my $WORLD = Dict [
-    cwd        => Maybe [Str],
-    env        => HashRef [ Maybe [Str] ],
-    out        => $STREAM,
-    err        => $STREAM,
-    out_tty    => Bool,
-    err_tty    => Bool,
-    clock      => CodeRef,
-    processors => CodeRef,
+    cwd            => Maybe [Str],
+    env            => HashRef [ Maybe [Str] ],
+    out            => $STREAM,
+    err            => $STREAM,
+    out_tty        => Bool,
+    err_tty        => Bool,
+    clock          => CodeRef,
+    processors     => CodeRef,
+    detector_hints => Optional [ HashRef [Str] ],
 ];
 my $REFUSED    = Dict [ refused => Dict [ status => Int, text => Str ] ];
 my $INVOCATION = $REFUSED | Dict [
@@ -115,6 +121,10 @@ sub _help ($command) {
 }
 
 sub main ($list) {
+    return main_with_detector_hints( {}, @$list );
+}
+
+sub main_with_detector_hints ( $hints, $list ) {
     for my $stream ( \*STDOUT, \*STDERR ) {
         next unless defined fileno $stream;
         binmode $stream, ':raw:encoding(UTF-8)'
@@ -131,6 +141,7 @@ sub main ($list) {
         clock      => sub { Time::HiRes::clock_gettime( Time::HiRes::CLOCK_MONOTONIC() ) },
         processors => \&Test::Mutation::Host::processors,
     };
+    $world->{detector_hints} = $hints if keys %$hints;
     return Test::Mutation::Signals::watch( sub { execute( plan( argv => $list, world => $world ), $world ) } );
 }
 
@@ -313,8 +324,9 @@ sub _run ( $invocation, $world ) {
     my $config   = $invocation->{config};
     my $listener = _progress( $invocation, $world );
     my $options  = { reports => 1, summary => $world->{env}{GITHUB_STEP_SUMMARY} };
-    $options->{paths} = $invocation->{paths}                      if exists $invocation->{paths};
-    $options          = { selection => $invocation->{selection} } if $invocation->{selection};
+    $options->{paths}          = $invocation->{paths}                      if exists $invocation->{paths};
+    $options                   = { selection => $invocation->{selection} } if $invocation->{selection};
+    $options->{detector_hints} = $world->{detector_hints}                  if exists $world->{detector_hints};
     my $result = Test::Mutation::Runner::run( $config, $listener, $options );
     _report( $result, $config, $world, $listener );
     return _concluded( $result, $config->min_score, $world );
@@ -437,15 +449,27 @@ sub _previous_report ( $directory, $select ) {
     return;
 }
 
+sub _summary_separator ( $path, $used ) {
+    return q{} unless $used;
+    my $previous = IO::File->new( $path, '<:raw' ) or return "\n";
+    my $last     = seek( $previous, -1, SEEK_END ) ? getc $previous : undef;
+    return defined $last && $last =~ /[\r\n]/ ? q{} : "\n";
+}
+
 sub _report_to_github ( $result, $world, $config ) {
     my $path = $world->{env}{GITHUB_STEP_SUMMARY};
     if ( defined $path && length $path ) {
         my @reports = map { File::Spec->catfile( $config->report_dir, $FILE_REPORT{$_} ) }
           grep { exists $FILE_REPORT{$_} } $config->format->@*;
-        open my $file, '>>:encoding(UTF-8)', File::Spec->rel2abs( $path, $config->root )
+        my $target = File::Spec->rel2abs( $path, $config->root );
+        open my $file, '>>:raw:encoding(UTF-8)', $target
           or Test::Mutation::Error::raise( 'file-unwritable', path => $path, reason => "$!" );
         flock $file, LOCK_EX or Test::Mutation::Error::raise( 'file-unwritable', path => $path, reason => "$!" );
-        print {$file} Test::Mutation::Report::GitHub::summary( $result, $result->min_score, \@reports, -s $file )
+        my $used      = -s $file;
+        my $separator = _summary_separator( $target, $used );
+        my $markdown =
+          Test::Mutation::Report::GitHub::summary( $result, $result->min_score, \@reports, $used + length $separator );
+        print {$file} ( length $markdown ? $separator . $markdown : q{} )
           or Test::Mutation::Error::raise( 'file-unwritable', path => $path, reason => "$!" );
         close $file or Test::Mutation::Error::raise( 'file-unclosable', path => $path, reason => "$!" );
     }
@@ -646,6 +670,12 @@ Test::Mutation::CLI - the mutation command
 
 Runs the command named by the first argument, C<run> when there is none, and returns the exit status.
 The call plans with the facts of the process and then carries the plan out.
+
+=head2 main_with_detector_hints
+
+Runs a complete uncached measurement with suggested covering tests keyed by mutant ID.
+The remaining arguments use the same command syntax as C<main>.
+Only a fresh observation can detect a mutant.
 
 =head2 plan
 

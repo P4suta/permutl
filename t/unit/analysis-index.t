@@ -9,9 +9,12 @@ use Test::Mutation::Settings;
 
 my $root = copy_of('calc');
 write_file( "$root/lib/Other.pm", 'package Other; sub plus { return $_[0] + 1 } 1;' );
-my $config  = sub (%given) { Test::Mutation::Settings::of_call( { root => $root, %given } ) };
-my $all     = Test::Mutation::Select::resolve( config => $config->() );
-my $id      = $all->mutants->[0]->id;
+my $config   = sub (%given) { Test::Mutation::Settings::of_call( { root => $root, %given } ) };
+my $all      = Test::Mutation::Select::resolve( config => $config->() );
+my $id       = $all->mutants->[0]->id;
+my $uncached = Test::Mutation::Select::resolve( config => $config->( cache => 0, mutant => [$id] ) );
+is [ map { $_->id } $uncached->mutants->@* ], [$id],      'an uncached lookup resolves the requested identifier';
+is [ sort keys $uncached->sources->%* ], ['lib/Calc.pm'], 'unrelated source files stay outside the uncached result';
 my $analyze = Test::Mutation::Syntax::PPI->can('analyze');
 my @parsed;
 {
@@ -34,6 +37,28 @@ my @parsed;
     Test::Mutation::Select::resolve( config => $config->( cache => 0 ) );
     is \@parsed, [qw(lib/Calc.pm lib/Other.pm)], 'disabling the cache forces fresh analysis';
 }
+subtest 'the index refreshes ranges whose left operand starts with a method' => sub {
+    my $project = File::Temp::tempdir( CLEANUP => 1 );
+    my $path    = 'lib/Range.pm';
+    write_file( "$project/$path", 'sub values { my ($rule, $a, $b) = @_; my @range = $rule->if + $a ... $b; @range }' );
+    my $settings = Test::Mutation::Settings::of_call( { root => $project, profile => 'extended' } );
+    {
+        local $Test::Mutation::Select::ANALYSIS_REVISION = 2;
+        Test::Mutation::Select::resolve( config => $settings );
+    }
+    my @reads;
+    no warnings 'redefine';
+    local *Test::Mutation::Syntax::PPI::analyze = sub ($source) {
+        push @reads, $source->path;
+        return $analyze->($source);
+    };
+    my $current = Test::Mutation::Select::resolve( config => $settings );
+    is \@reads, [$path], 'the earlier precedence rules require one fresh analysis';
+    is [ grep { $_->mutator eq 'range-boundary' } $current->mutants->@* ], [], 'a list range has no scalar flip-flop';
+    Test::Mutation::Select::resolve( config => $settings );
+    is \@reads, [$path], 'the corrected index serves the next lookup without reparsing';
+};
+
 subtest 'a missing historical identifier names its previous file' => sub {
     my @refused;
     no warnings 'redefine';
@@ -56,11 +81,15 @@ subtest 'an unfiltered catalog decodes candidates as it reads them' => sub {
     my ($analysis) =
       $db->selectrow_array( 'SELECT analysis FROM candidate WHERE id = ? ORDER BY analysis LIMIT 1', undef, $id );
     my @events;
+    my $sorts;
     my $fetch     = DBI::st->can('fetchrow_array');
     my $construct = Test::Mutation::Mutant->can('new');
     no warnings 'redefine';
     local *DBI::st::fetchrow_array = sub ( $query, @arguments ) {
-        push @events, 'read' if $query->{Statement} =~ /\bFROM candidate\b/i;
+        if ( $query->{Statement} =~ /\bFROM candidate\b/i ) {
+            push @events, 'read';
+            $sorts = $query->sqlite_st_status->{sort};
+        }
         return $fetch->( $query, @arguments );
     };
     local *Test::Mutation::Mutant::new = sub (@arguments) {
@@ -71,6 +100,51 @@ subtest 'an unfiltered catalog decodes candidates as it reads them' => sub {
     cmp_ok scalar $file->{mutants}->@*, '>', 1, 'the file contains multiple candidates';
     is [ @events[ 0 .. 3 ] ], [qw(read decode read decode)],
       'the cursor releases each encoded row before fetching another';
+    is $sorts, 0, 'SQLite streams the catalog in its stored order without a temporary sort';
+};
+subtest 'invalid catalog operations fail at the requested interface' => sub {
+    my $directory = File::Temp::tempdir( CLEANUP => 1 );
+    my $path      = "$directory/catalog.sqlite";
+    isa_ok dies { Test::Mutation::Store::Analysis::publish( $path, [ [ 'source', {} ] ] ) }, ['Error::TypeTiny'],
+      'incomplete analysis facts are rejected';
+    ok !-e $path, 'an invalid batch creates no database';
+    my $db = Test::Mutation::Store::database($path);
+    isa_ok dies { Test::Mutation::Store::Analysis::read_file( $db, 'source' ) }, ['Error::TypeTiny'],
+      'a single-file lookup requires a prefix filter';
+    isa_ok dies { Test::Mutation::Store::Analysis::read_files( undef, [], [] ) }, ['Error::TypeTiny'],
+      'an empty batch still requires an open database';
+};
+subtest 'retrying a partially stored batch keeps both file analyses' => sub {
+    my $directory = File::Temp::tempdir( CLEANUP => 1 );
+    my $path      = "$directory/catalog.sqlite";
+    my ( $stored_mutant, $queued_mutant ) = $all->mutants->@[ 0, 1 ];
+    my $saved = { problem => undef, left_out => 0, refusals => [], rejected => [], mutants => [$stored_mutant] };
+    my $next  = { %$saved, left_out => 3, mutants => [$queued_mutant] };
+    Test::Mutation::Store::Analysis::publish( $path, [ [ 'existing', $saved ] ] );
+    Test::Mutation::Store::Analysis::publish( $path, [ [ 'existing', $next ], [ 'later', $next ] ] );
+    my $db    = Test::Mutation::Store::read_database($path);
+    my $files = Test::Mutation::Store::Analysis::read_files( $db, [qw(existing later)], [] );
+    is $files->{existing}, $saved, 'the existing file retains its first analysis and candidate';
+    is $files->{later},    $next,  'the later file and its candidate are committed in the same retry';
+};
+subtest 'a failed candidate write rolls back the entire catalog batch' => sub {
+    my $directory = File::Temp::tempdir( CLEANUP => 1 );
+    my $path      = "$directory/catalog.sqlite";
+    my $db        = Test::Mutation::Store::database($path);
+    $db->do(<<'SQL');
+CREATE TRIGGER refuse_candidate BEFORE INSERT ON candidate WHEN NEW.analysis = 'later'
+BEGIN SELECT RAISE(ABORT, 'refused candidate'); END
+SQL
+    my $facts = { problem => undef, left_out => 0, refusals => [], rejected => [], mutants => [ $all->mutants->[0] ] };
+    my $batch = [ map { [ $_, $facts ] } qw(first later) ];
+    like dies { Test::Mutation::Store::Analysis::publish( $path, $batch ) }, qr/refused candidate/,
+      'a write error reaches the caller';
+    is Test::Mutation::Store::Analysis::read_files( $db, [qw(first later)], [] ), {},
+      'a separate connection sees no part of the failed batch';
+    $db->do('DROP TRIGGER refuse_candidate');
+    is Test::Mutation::Store::Analysis::publish( $path, $batch ), undef, 'a successful retry returns no value';
+    is Test::Mutation::Store::Analysis::read_files( $db, [qw(first later)], [] ), { first => $facts, later => $facts },
+      'both file analyses and their candidates are visible after the commit';
 };
 subtest 'thousands of named mutants fit within SQLite query limits' => sub {
     my $project = File::Temp::tempdir( CLEANUP => 1 );

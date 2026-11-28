@@ -110,7 +110,7 @@ sub refresh ( $prior, $current ) {
     my $scope = $current->measured_scope;
 
     if ( @ids > $current->entries->@* ) {
-        $scope = $prior->measured_scope // $prior->selection;
+        $scope = $prior->score_scope;
         $scope = { mutants => \@ids } if %replacement && keys %$scope;
     }
     return Test::Mutation::Result->new(
@@ -129,7 +129,7 @@ sub refresh ( $prior, $current ) {
 sub _confirms_inputs ( $prior, $current ) {
     for my $report ( $prior, $current ) {
         return 0 if defined $report->interrupted || $report->baseline_failures->@* || $report->cache_mismatch;
-        return 0 unless defined $report->measurement_digest;
+        return 0 unless defined $report->verified_measurement_digest;
         return 0 if $report->tests->@* && !defined $report->dependency_digest;
     }
     return 0 if $prior->measurement_digest ne $current->measurement_digest;
@@ -201,7 +201,7 @@ sub _check_inputs ( $whole, $name, $result ) {
         'input-malformed',
         path   => $name,
         reason => 'measurement inputs are missing, rerun every shard before merging'
-    ) if !defined $result->measurement_digest || ( $result->tests->@* && !defined $dependencies );
+    ) if !defined $result->verified_measurement_digest || ( $result->tests->@* && !defined $dependencies );
     Test::Mutation::Error::raise(
         'input-malformed',
         path   => $name,

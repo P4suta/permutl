@@ -9,7 +9,7 @@ use Exporter 'import';
 use Test2::API     qw(context);
 use Test::Mutation ();
 
-our @EXPORT_OK = qw(copy_of leftovers ran ran_from run_fixture tree_digest statuses write_file);
+our @EXPORT_OK = qw(copy_of leftovers ran ran_from run_fixture tree_digest statuses with_driver_shims write_file);
 
 sub write_file ( $path, $content ) {
     my ($directory) = $path =~ m{\A(.*)/};
@@ -49,6 +49,25 @@ sub _left_ok ( $what, $stayed, $expected ) {
     return;
 }
 
+# Move the active measurement switches to the driver command so its independent project inherits the caller's preloads.
+sub with_driver_shims ($driver) {
+    my $options = $ENV{PERL5OPT} || q{};
+    my @switches;
+    for my $generation ( 1 .. ( $ENV{TEST_MUTATION_GENERATION} || 0 ) ) {
+        my $name = "Test/Mutation/Shim/G$generation.pm";
+        my $file = $INC{$name};
+        next if !defined $file || ref $file;
+        my ($directory) = $file =~ m{\A(.+)/\Q$name\E\z}s;
+        next unless defined $directory;
+        my $include = $directory =~ /\s/ ? '-Mlib+pack(q(H*),q(' . unpack( 'H*', $directory ) . '))' : "-I$directory";
+        my $load    = "-MTest::Mutation::Shim::G$generation";
+        push @switches, "-I$directory", $load if $options =~ s/(?<!\S)\Q$include $load\E(?!\S)//;
+    }
+    return $driver->() unless @switches;
+    local $ENV{PERL5OPT} = join q{ }, split q{ }, $options;
+    return $driver->(@switches);
+}
+
 sub _spawn ( $library, $root, $temporary, @arguments ) {
     my $output = File::Temp->new;
     my $errors = File::Temp->new;
@@ -60,7 +79,8 @@ sub _spawn ( $library, $root, $temporary, @arguments ) {
         open STDIN,  '<', '/dev/null'       or die "stdin: $!";
         open STDOUT, '>', $output->filename or die "stdout: $!";
         open STDERR, '>', $errors->filename or die "stderr: $!";
-        exec {$^X} $^X, "-I$library", $COMMAND, @arguments or die "exec: $!";
+        with_driver_shims(
+            sub (@switches) { exec {$^X} $^X, "-I$library", @switches, $COMMAND, @arguments or die "exec: $!" } );
     }
     waitpid $pid, 0;
     my $read = sub ($file) {
@@ -141,10 +161,14 @@ sub run_fixture ( $root, %settings ) {
     # The run takes its settings as a call of the library does.
     my $result = eval {
         local $ENV{TMPDIR} = $temporary;
-        Test::Mutation::run(
-            root => $root,
-            jobs => 2,
-            %settings, on_event => sub ( $event, $data ) { push @events, $event }
+        with_driver_shims(
+            sub {
+                Test::Mutation::run(
+                    root => $root,
+                    jobs => 2,
+                    %settings, on_event => sub ( $event, $data ) { push @events, $event }
+                );
+            }
         );
     };
     my $error = $@;

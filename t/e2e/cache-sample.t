@@ -22,6 +22,15 @@ my $value = Value::plus(2);
 if (-e $ENV{CHECK_CHANGED_VALUE}) { is $value, 3, 'the sum' }
 else { pass 'the sum is observed' }
 PERL
+write_file( "$root/t/conditional.t", <<'PERL' );
+use Test::More tests => 1;
+if (-e $ENV{CHECK_CHANGED_VALUE}) {
+    require Value;
+    is Value::plus(2), 3, 'the new branch uses the sum';
+} else {
+    pass 'the sum is unused';
+}
+PERL
 
 my ($first) = run_fixture( $root, equivalence => 0 );
 my ($warm)  = run_fixture( $root, equivalence => 0 );
@@ -34,6 +43,8 @@ my ($changed) = run_fixture( $root, equivalence => 0 );
 is $changed->reused, 0, 'an inconsistent sample discards all cached verdicts';
 is [ map { $_->{status} } $changed->entries->@* ], [ ('Killed') x $count ],
   'every returned verdict comes from a fresh measurement';
+is [ map { [ sort $_->{covered_by}->@* ] } $changed->entries->@* ],
+  [ ( [qw(t/conditional.t t/value.t)] ) x $count ], 'every new job uses the coverage of the repeated baseline';
 ok !$changed->conclusive, 'the mismatch prevents the run from passing its gate';
 like $changed->warnings, bag { item match qr/cached verdict.*fresh measurement/; etc },
   'the report names the discrepancy';
@@ -46,7 +57,8 @@ my $cache_file = "$root/.mutation/measurement.sqlite";
 my $saved      = Test::Mutation::Store::load($cache_file);
 ok keys %$saved, 'the project holds measured verdicts before its source changes';
 write_file( "$root/lib/Value.pm", "package Value;\n1;\n" );
-unlink "$root/t/value.t" or die "remove the test: $!";
+unlink "$root/t/value.t"       or die "remove the test: $!";
+unlink "$root/t/conditional.t" or die "remove the conditional test: $!";
 for my $case (
     [ 'disabled caching',    0, {} ],
     [ 'a partial selection', 1, { paths         => { 'lib/Value.pm' => [] } } ],
@@ -63,6 +75,33 @@ my ($empty) = run_fixture( $root, equivalence => 0 );
 is $empty->entries, [], 'removing the last mutation produces an empty inventory';
 is Test::Mutation::Store::load("$root/.mutation/measurement.sqlite"), {},
   'records of the last removed source are pruned';
+
+subtest 'a warm copy checks the configuration bytes that the tests will read' => sub {
+    my $project  = "$parent/config-input";
+    my $settings = write_file( "$project/settings.toml", "# original\n" );
+    write_file( "$project/lib/Value.pm", "package Value; sub plus { \$_[0] + 1 } 1;\n" );
+    write_file( "$project/t/value.t",    <<'PERL' );
+use Test::More tests => 2;
+use Value;
+open my $file, '<', 'settings.toml' or die $!;
+is scalar readline $file, "# original\n", 'the expected input was copied';
+close $file or die $!;
+is Value::plus(2), 3, 'the sum';
+PERL
+    my %options  = ( root => $project, config => 'settings.toml', jobs => 1, equivalence => 0 );
+    my $recorded = Test::Mutation::run(%options);
+    is $recorded->baseline_failures, [], 'the original test passes with the recorded configuration bytes';
+    my $error = dies {
+        Test::Mutation::run(
+            %options,
+            on_event => sub ( $event, $data ) {
+                write_file( $settings, "# changed\n" ) if $event eq 'phase' && $data->{name} eq 'acquire';
+                return;
+            }
+        );
+    };
+    like $error, qr/measurement inputs changed/, 'a copy that no longer matches the saved original is rejected';
+};
 
 subtest 'an interrupted cache sample keeps only the verdicts it measured' => sub {
     my $project = "$parent/interrupted";

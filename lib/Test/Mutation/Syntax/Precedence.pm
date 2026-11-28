@@ -221,7 +221,8 @@ sub _conditional ( $state, $start, $mark ) {
 
 # An arrow takes a method name, a subscript, or a list of arguments, and the subscripts after it.
 sub _arrow ( $state, $index ) {
-    return $index if !_starts( $state, $index ) && _item( $state, $index )->[0] ne 'subscript';
+    my $kind = _item( $state, $index )->[0];
+    return $index unless $kind eq 'word' || $kind eq 'subscript' || _starts( $state, $index );
     $index++;
     $index++ if _item( $state, $index )->[0] eq 'list';
     return _subscripts( $state, $index );

@@ -92,11 +92,12 @@ signature_for run => (
         InstanceOf ['Test::Mutation::Config'],
         CodeRef,
         Dict [
-            paths         => Optional [ Maybe [PathSelection] ],
-            selection     => Optional [ InstanceOf ['Test::Mutation::Selection'] ],
-            baseline_only => Optional [Bool],
-            reports       => Optional [Bool],
-            summary       => Optional [ Maybe [Str] ]
+            paths          => Optional [ Maybe [PathSelection] ],
+            selection      => Optional [ InstanceOf ['Test::Mutation::Selection'] ],
+            baseline_only  => Optional [Bool],
+            detector_hints => Optional [ HashRef [Str] ],
+            reports        => Optional [Bool],
+            summary        => Optional [ Maybe [Str] ]
         ],
         { default => sub { {} } }
     ],
@@ -113,19 +114,24 @@ sub run ( $config, $notify, $options = {} ) {
     };
     my $started = Time::HiRes::time();
     Test::Mutation::Event::phase( $listener, 'resolve' );
-    my $project = Cwd::abs_path( $config->root );
-    my $run     = {
-        config   => $config,
-        options  => $options,
-        project  => $project,
-        root     => $project,
-        listener => $listener,
-        jobs     => $config->jobs,
-        sequence => 0,
-        first    => {},
-        warnings => {},
-        free     => {},
-        stats    => { map { $_ => 0 } qw(copies walks compiles spawns listings baseline_tests verifications) },
+    my $project  = Cwd::abs_path( $config->root );
+    my %options  = $options->%*;
+    my $hints    = delete $options{detector_hints};
+    my @filters  = ( $config->since, $config->shard, $config->mutant->@*, @options{qw(paths selection)} );
+    my $filtered = grep { defined } @filters;
+    my $run      = {
+        config         => $config,
+        options        => \%options,
+        detector_hints => $config->cache || $filtered ? {} : $hints,
+        project        => $project,
+        root           => $project,
+        listener       => $listener,
+        jobs           => $config->jobs,
+        sequence       => 0,
+        first          => {},
+        warnings       => {},
+        free           => {},
+        stats          => { map { $_ => 0 } qw(copies walks compiles spawns listings baseline_tests verifications) },
     };
     my $release = sub {
         Test::Mutation::Try::with_cleanup(
@@ -454,6 +460,7 @@ sub _measure ( $run, $started ) {
     }
 
     Test::Mutation::Event::phase( $listener, 'conclude' );
+    $result{measurement_digest} = undef if $run->{missing_compiler_inputs};
     my $compiler = $run->{compiler_inputs} || {};
     return {
         %result,
@@ -465,6 +472,10 @@ sub _measure ( $run, $started ) {
         in_copies       => $config->in_place ? 0 : 1,
         stats           => $run->{stats},
     };
+}
+
+sub _compiler_parser_versions () {
+    return ( PPI->VERSION, PPIx::QuoteLike->VERSION, PPIx::Regexp->VERSION );
 }
 
 sub _measurement_digest ( $run, $selection ) {
@@ -487,8 +498,8 @@ sub _measurement_digest ( $run, $selection ) {
           { project => $project_digest, tests => \%tests, sources => $selection->digests, separate => \@separate };
     }
     return Test::Mutation::Store::Key::digest(
-        $VERSION,
-        Test::Mutation::Store::Key::digest( map { $_->name } $selection->mutators->@* ),
+        Test::Mutation::Select::measurement_rules( $config, $selection ),
+        _compiler_parser_versions(),
         Test::Mutation::Store::Key::digest( map { ( $_, $selection->digests->{$_} ) } @sources ),
         Test::Mutation::Store::Key::interpreter_build( $selection->perl ),
         $project_digest,
@@ -547,11 +558,7 @@ sub _copy_exclusions ($run) {
     my $project = $run->{project};
     my @skip    = ( '.git', map { _inside( $project, $_ ) } $config->cache_dir, $config->report_dir );
     return @skip if $config->in_place;
-    unless ( $run->{report_outputs} ) {
-        my $view =
-          _available_digest( sub { return Test::Mutation::Store::Key::project( $project, \@skip, $config->link ) } );
-        $run->{report_outputs} = $view ? $view->{outputs} : [];
-    }
+    $run->{report_outputs} ||= Test::Mutation::Store::Key::published_outputs( $project, \@skip, $config->link );
     return @skip, $run->{report_outputs}->@*;
 }
 
@@ -631,7 +638,7 @@ sub _plan_originals ($run) {
         my $record = $tests{$test};
         my $key    = _original_key( $run, $shared, $test, $record );
         next unless defined $key && $key eq $record->{inputs};
-        $verified{$test} = { %$record, anomalies => {}, early => 0, reusable => 1 };
+        $verified{$test} = { %$record, anomalies => {}, reusable => 1 };
     }
     return { tests => \%verified, missing => [ grep { !exists $verified{$_} } @$all ], shared => $shared };
 }
@@ -772,7 +779,13 @@ sub _prepare_work ($run) {
         'compiler/Test/Mutation/CompilerInputs',
         'mutants', 'records', 'tmp'
     );
-    _spew( "$work/shim/Test/Mutation/Shim/G$generation.pm", shim_text($generation) );
+    my $shim = shim_text($generation);
+    _spew( "$work/shim/Test/Mutation/Shim/G$generation.pm", $shim );
+
+    # A standalone target can load its own module under the name used for the preloaded shim.
+    my $trace = Test::Mutation::Witness::trace_package($work);
+    $shim =~ s/^ \Qpackage Test::Mutation::Shim::G$generation;\E $/package $trace;/mx;
+    _spew( "$work/trace.pl", $shim );
     _spew( "$work/compiler/Test/Mutation/CompilerInputs/G$generation.pm",
         _generation_text( $COMPILER_FILE, $generation ) );
     $run->{generation} = $generation;
@@ -1303,7 +1316,6 @@ sub _baseline_records ( $run, $tests, $targets, $outcome ) {
             breakable => \%breakable,
             duration  => $result->{duration},
             files     => \%files,
-            early     => $result->{early},
             anomalies => \%anomalies,
             reusable  => _reusable_baseline( $run, $test, $result, $record, \%anomalies )
         };
@@ -1399,6 +1411,28 @@ sub _raw_baseline ( $run, $tests, $outcome ) {
     return;
 }
 
+sub _fresh_job ( $mutant, $tests, $duration = 0 ) {
+    return {
+        mutant   => $mutant,
+        tests    => $tests,
+        index    => 0,
+        verdict  => Test::Mutation::Verdict::start(),
+        duration => $duration
+    };
+}
+
+sub _eligible_detector ( $rules, $tests, $hint ) {
+    return       unless defined $hint;
+    return       unless List::Util::first { $tests->[$_] eq $hint } 1 .. $#$tests;
+    return $hint unless $rules;
+    my $queue = Test::Mutation::Schedule::queue( $rules, $tests );
+    while ( my $job = $queue->get_job ) {
+        return       if $job->is_spinner;
+        return $hint if $job->filename eq $hint;
+    }
+    return;
+}
+
 sub _measurement_jobs ( $run, $mutants, $baseline, $cache, $entries ) {
     my $config   = $run->{config};
     my $coverage = Test::Mutation::Coverage->new(
@@ -1427,13 +1461,11 @@ sub _measurement_jobs ( $run, $mutants, $baseline, $cache, $entries ) {
         while ( $position < @$mutants ) {
             my $mutant = $mutants->[ $position++ ];
             next if $entries->{ $mutant->id };
-            return {
-                mutant   => $mutant,
-                tests    => $tests_for->($mutant),
-                index    => 0,
-                verdict  => Test::Mutation::Verdict::start(),
-                duration => 0
-            };
+            my $tests = $tests_for->($mutant);
+            my $hint  = _eligible_detector( $run->{rules}, $tests, $run->{detector_hints}{ $mutant->id } );
+            my $job   = _fresh_job( $mutant, $tests );
+            $job->{detector} = $hint if defined $hint;
+            return $job;
         }
         return;
     };
@@ -1493,6 +1525,7 @@ sub _mutants ( $run, $mutants, $baseline, $sample_only = 0 ) {
             return [ map { $entry_of{ $_->id } } @$mutants ];
         }
     }
+    local $run->{sampling_verdicts} = $sample_only;
     _execute_jobs( $run, $baseline, $next_job, \%entry_of, $cache );
 
     my @entries = map { $entry_of{ $_->id } } $mutants->@*;
@@ -1644,7 +1677,11 @@ sub _scheduled_result ( $run, $baseline, $schedule, $task, $result ) {
         $job->{duration} += $result->{duration};
         _release( $run, $job );
         delete $job->{spec};
-        return if $job->{restore_error};
+        if ( $job->{restore_error} ) {
+            return unless defined $job->{detector};
+            _discard_detector( $run, $job );
+            return _next_test( $run, $job, $baseline );
+        }
         my $repeat = _next_test( $run, $job, $baseline ) or return;
         $repeat->{payload}{isolated}     = 1;
         $repeat->{payload}{confirm_read} = 1 if $payload->{confirm_read};
@@ -1706,6 +1743,25 @@ sub _changed_paths ( $run, $changes ) {
     return;
 }
 
+sub _discard_detector ( $run, $job ) {
+    $run->{stats}{verifications}++;
+    $job->%* = _fresh_job( $job->{mutant}, $job->{tests}, $job->{duration} )->%*;
+    return;
+}
+
+sub _record_observation ( $run, $job ) {
+    $job->{verdict} = Test::Mutation::Verdict::step( $job->{verdict}, $job->{outcome} );
+    if ( defined $job->{detector} ) {
+        _release( $run, $job );
+        if ( $job->{restore_error} || Test::Mutation::Verdict::final( $job->{verdict} ) ne 'Killed' ) {
+            return _discard_detector( $run, $job );
+        }
+    }
+    push $job->{observations}[ $job->{first} ? 1 : 0 ]->@*, $job->{outcome};
+    $job->{index}++;
+    return;
+}
+
 sub _after_task ( $run, $baseline, $task, $result ) {
     my $job  = $task->{payload}{job};
     my $kind = $task->{payload}{kind};
@@ -1734,9 +1790,7 @@ sub _after_task ( $run, $baseline, $task, $result ) {
     return $check if $check;
 
     if ( $kind !~ /\Acode-/ ) {
-        push $job->{observations}[ $job->{first} ? 1 : 0 ]->@*, $job->{outcome};
-        $job->{verdict} = Test::Mutation::Verdict::step( $job->{verdict}, $job->{outcome} );
-        $job->{index}++;
+        _record_observation( $run, $job );
         return _next_test( $run, $job, $baseline )
           if !defined $job->{verdict}{status} && $job->{index} < $job->{tests}->@*;
         my $trial = Test::Mutation::Verdict::conclude( $job->{verdict} );
@@ -1791,11 +1845,12 @@ sub _fingerprint ( $run, $baseline ) {
         @targets
     );
     return Test::Mutation::Store::Key::digest(
-        $VERSION,                                         Test::Mutation::Store::format_version(),
-        _module_text($SHIM_FILE),                         _module_text($COMPILER_FILE),
-        _module_text('Test/Mutation/Witness.pm'),         Test::Mutation::Store::Key::interpreter( $run->{perl} ),
-        Test::Mutation::Store::Key::digest(@libraries),   Test::Mutation::Store::Key::digest(@launch),
-        Test::Mutation::Store::Key::environment( \%ENV ), _cache_project( $run, \@targets ),
+        $VERSION,                                                    Test::Mutation::Store::format_version(),
+        Test::Mutation::Result::supported_compiler_input_protocol(), _module_text($SHIM_FILE),
+        _module_text($COMPILER_FILE),                                _module_text('Test/Mutation/Witness.pm'),
+        Test::Mutation::Store::Key::interpreter( $run->{perl} ),     Test::Mutation::Store::Key::digest(@libraries),
+        Test::Mutation::Store::Key::digest(@launch),                 Test::Mutation::Store::Key::environment( \%ENV ),
+        _cache_project( $run, \@targets ),                           _compiler_parser_versions(),
     );
 }
 
@@ -1868,8 +1923,12 @@ sub _open_cache ( $run, $baseline, $mutants = undef ) {
 }
 
 sub _verdict_key ( $cache, $mutant, $tests, $status, $killer ) {
-    my $mutation =
-      Test::Mutation::Store::Key::digest( $mutant->id, $mutant->replacement, $cache->{targets}{ $mutant->path } );
+    my $mutation = Test::Mutation::Store::Key::digest(
+        $mutant->id, $mutant->replacement, $cache->{targets}{ $mutant->path },
+        $mutant->scope->@*,
+        $mutant->comparable || 0,
+        @{ $mutant->introduced_call || [] }
+    );
     return Test::Mutation::Store::Key::digest( $cache->{shared}, $mutation, 'none' ) if $status eq 'NoCoverage';
     my @needed = @$tests;
     if ( $status eq 'Killed' ) {
@@ -1884,12 +1943,23 @@ sub _verdict_key ( $cache, $mutant, $tests, $status, $killer ) {
     return Test::Mutation::Store::Key::digest( $mutation, map { ( $_, $cache->{facts}{$_} ) } @needed );
 }
 
+sub _source_read_operands ( $run, $path ) {
+    return $run->{source_reads}{$path} if exists $run->{source_reads}{$path};
+    my $source = $run->{sources}{$path};
+    return $run->{source_reads}{$path} = _encode_read_operands( $source, $source->text, 1 );
+}
+
+sub _may_read_at_compile_time ( $run, $path ) {
+    return $run->{sources}{$path}->text =~ /\b(?:use|no)\b/ || length _source_read_operands( $run, $path );
+}
+
 sub _reused_entry ( $run, $cache, $mutant, $tests ) {
     return if $run->{config}->mutant->@*;
     my $record = $cache->{records}{ $mutant->id } or return;
     return if $record->{status} eq 'NoCoverage' && $tests->@*;
     my $key = _verdict_key( $cache, $mutant, $tests, $record->{status}, $record->{by} );
     return unless defined $key && $key eq $record->{inputs};
+    return if !defined $record->{compiler_inputs} && _may_read_at_compile_time( $run, $mutant->path );
     my $inputs = $record->{compiler_inputs} || {};
     for my $path ( keys %$inputs ) {
         my $digest = _compiler_input_digest( $run, $path );
@@ -1924,16 +1994,20 @@ sub _save_observation ( $run, $cache, $entry, $may_wait = 1 ) {
 }
 
 sub _next_code ( $run, $job ) {
-    return if !$run->{config}->equivalence || defined $job->{code} || !$job->{mutant}->comparable;
-    return if !$UNDETECTED{ Test::Mutation::Verdict::final( $job->{verdict} ) };
-    my $mutant = $job->{mutant};
-    my $path   = $mutant->path;
     return if defined $job->{stale};
-    if ( !defined $job->{file} ) {
-        ( $job->{file} ) = _changed_source( $run, $run->{sources}{$path}, $mutant );
-    }
+    my $mutant   = $job->{mutant};
+    my $path     = $mutant->path;
     my $original = $run->{original_compile}{$path};
-    return _compile_task( $run, $job, 'code-original', "$run->{root}/$path", '-MO=Deparse' ) unless $original;
+    my $compare =
+         $run->{config}->equivalence
+      && !defined $job->{code}
+      && $mutant->comparable
+      && $UNDETECTED{ Test::Mutation::Verdict::final( $job->{verdict} ) };
+    if ( !$original ) {
+        return unless $compare || _observe_original_inputs( $run, $path );
+        return _compile_task( $run, $job, 'code-original', "$run->{root}/$path", '-MO=Deparse' );
+    }
+    return unless $compare;
     if ( !$original->{passed} ) {
         _warn( $run, Test::Mutation::Message::warning( 'syntax-check-failed', path => $path ) );
         return;
@@ -1943,7 +2017,16 @@ sub _next_code ( $run, $job ) {
         _warn( $run, Test::Mutation::Message::warning( 'decompiled-code-unstable', path => $path ) );
         return;
     }
+    if ( !defined $job->{file} ) {
+        ( $job->{file} ) = _changed_source( $run, $run->{sources}{$path}, $mutant );
+    }
     return _compile_task( $run, $job, 'code-mutant', $job->{file}, '-MO=Deparse' );
+}
+
+sub _observe_original_inputs ( $run, $path ) {
+    return if $run->{sampling_verdicts};
+    return unless $run->{config}->equivalence || defined $run->{config}->shard || $run->{options}{reports};
+    return _may_read_at_compile_time( $run, $path );
 }
 
 sub _after_code ( $run, $task, $result ) {
@@ -2105,7 +2188,7 @@ sub _verify_read ( $run, $baseline, $job ) {
 sub _next_test ( $run, $job, $baseline ) {
     my $config    = $run->{config};
     my $mutant    = $job->{mutant};
-    my $test      = $job->{tests}[ $job->{index} ];
+    my $test      = defined $job->{detector} ? $job->{detector}                       : $job->{tests}[ $job->{index} ];
     my $raw       = $run->{sensitive}{$test} && keys $run->{sensitive}{$test}->%* ? 1 : 0;
     my $proof     = $run->{controls}{$test};
     my $reference = $proof && $proof->{root} ? $proof->{root} : $run->{root};
@@ -2130,13 +2213,17 @@ sub _next_test ( $run, $job, $baseline ) {
         test            => $test,
         spec            => $job->{spec},
         timeout         => List::Util::max( $duration, $config->timeout_floor ),
-        stop_on_failure => $baseline->{tests}{$test}{early} ? 0 : 1,
+        stop_on_failure => 1,
         payload         => { kind => 'test', job => $job, $anomaly ? ( baseline_anomaly => $anomaly ) : () },
     );
 }
 
+sub _compiler_exited ($result) {
+    return !$result->{signal} && !$result->{timed_out} && !$result->{overflowed};
+}
+
 sub _compiled ($result) {
-    return !$result->{exit} && !$result->{signal} && !$result->{timed_out} && !$result->{overflowed};
+    return !$result->{exit} && _compiler_exited($result);
 }
 
 sub _compiler_input_digest ( $run, $path ) {
@@ -2149,24 +2236,22 @@ sub _compiler_input_digest ( $run, $path ) {
     );
 }
 
-sub _loaded_read_operands ( $run, $file, $check_load = 0 ) {
-    my $memo = $run->{module_reads}{$file} ||= {};
-    return $memo->{$check_load} if exists $memo->{$check_load};
+sub _loaded_read_operands ( $run, $file ) {
+    return $run->{module_reads}{$file} if exists $run->{module_reads}{$file};
     my $bytes = _available_digest( sub { Test::Mutation::Source::read_bytes($file) } );
     return q{?} unless defined $bytes;
     my $source = Test::Mutation::Source->from_bytes( path => $file, bytes => $bytes );
-    return $memo->{$check_load} = _encode_read_operands( $source, $source->text, $check_load );
+    return $run->{module_reads}{$file} = _encode_read_operands( $source, $source->text, 1 );
 }
 
-sub _compiler_inputs ( $run, $tmp, $result, $requested ) {
+sub _compiler_inputs ( $run, $tmp, $result ) {
     return unless -f "$tmp/inputs";
     my @lines = split /\n/, Test::Mutation::Source::read_bytes("$tmp/inputs");
     return unless @lines && pop(@lines) eq q{.};
-    my ( @modules, %inputs );
+    my %inputs;
     for my $line (@lines) {
         if ( $line =~ /\Am((?:[0-9a-f]{2})+)\z/ ) {
-            my $file = pack 'H*', $1;
-            push @modules, $file;
+            my $file  = pack 'H*', $1;
             my $reads = _loaded_read_operands( $run, $file );
             $result->{module_reads}{$_} = 1 for split /,/, $reads;
             next;
@@ -2182,16 +2267,17 @@ sub _compiler_inputs ( $run, $tmp, $result, $requested ) {
         return unless defined $digest;
         $inputs{$path} = $digest;
     }
-    if ( $requested =~ /(?:\A|,)e/ || grep { /\Ae/ } keys %{ $result->{module_reads} || {} } ) {
-        $result->{module_reads}{q{?}} = 1 if grep { _loaded_read_operands( $run, $_, 1 ) eq q{?} } @modules;
-    }
     return \%inputs;
 }
 
 sub _remember_compiler_inputs ( $run, $job, $task, $result ) {
     my $payload       = $task->{payload};
     my $read_operands = $task->{env}{TEST_MUTATION_COMPILER_READS};
-    $result->{compiler_inputs} = _compiler_inputs( $run, $payload->{tmp}, $result, $read_operands )
+    if ( !_compiled($result) ) {
+        $job->{unbound_compiler}   = 1;
+        $result->{compiler_inputs} = undef unless $payload->{kind} eq 'syntax-mutant' && _compiler_exited($result);
+    }
+    $result->{compiler_inputs} = _compiler_inputs( $run, $payload->{tmp}, $result )
       unless exists $result->{compiler_inputs};
     my %requested = map  { $_ => 1 } split /,/, $read_operands;
     my $missing   = grep { !$requested{$_} } keys %{ $result->{module_reads} || {} };
@@ -2209,17 +2295,10 @@ sub _remember_compiler_inputs ( $run, $job, $task, $result ) {
         $run->{compiler_inputs}{$_} = $job->{compiler_inputs}{$_} = $inputs->{$_} for keys %$inputs;
     }
     else {
-        if ( $result->{opaque_reads} || length $task->{env}{TEST_MUTATION_COMPILER_READS} ) {
-            $result->{opaque_reads} = 1;
-            if ( defined $payload->{original} ) {
-                $result->{observed_code} =
-                  Test::Mutation::Store::Key::digest( _compiled($result) ? $result->{digest} : 'compile-failed' )
-                  unless exists $result->{observed_code};
-                $run->{compiler_inputs}{"deparse:$payload->{original}"} = $result->{observed_code};
-            }
-        }
-        $result->{digest}        = q{};
-        $job->{unbound_compiler} = 1;
+        $run->{missing_compiler_inputs} = 1 if $payload->{kind} ne 'code-mutant';
+        $result->{opaque_reads}         = 1 if length $read_operands;
+        $result->{digest}               = q{};
+        $job->{unbound_compiler}        = 1;
     }
     return;
 }
@@ -2228,8 +2307,9 @@ sub _compiler_read_operands ( $run, $job, $original ) {
     my $mutant = $job->{mutant};
     my $source = $run->{sources}{ $mutant->path };
     my $text   = $source->text;
-    return q{} unless $text =~ /\b(?:BEGIN|UNITCHECK|CHECK)\b/;
-    $text = $source->replace_span( $mutant->start, $mutant->end, $mutant->replacement ) unless $original;
+    my $reads  = _source_read_operands( $run, $mutant->path );
+    return $reads if $original || $reads eq q{?} || $text !~ /\b(?:BEGIN|UNITCHECK|CHECK)\b/;
+    $text = $source->replace_span( $mutant->start, $mutant->end, $mutant->replacement );
     return _encode_read_operands( $source, $text );
 }
 
@@ -2256,7 +2336,8 @@ sub _compile_task ( $run, $job, $kind, $file, $switch ) {
     my $root = $original || !$job->{copy} ? $run->{root} : $job->{copy}{root};
     my $tmp  = "$run->{work}/tmp/" . ++$run->{sequence};
     Test::Mutation::Tree::make($tmp);
-    my $option         = $original ? '-MO=Deparse' : $switch;
+    my $option = $switch;
+    $option = $run->{config}->equivalence ? '-MO=Deparse' : '-c' if $original;
     my $source         = $run->{sources}{$path}->text;
     my $standard_hints = $option eq '-MO=Deparse' && $source =~ /\buse\s+charnames\b/ && $source !~ /[\$%]\^H/;
     my $imports        = $run->{compiler_imports}{$path} || q{};
@@ -2316,7 +2397,7 @@ sub _finish ( $run, $job ) {
     }
     else {
         my %inputs = ( %{ $original && $original->{inputs} || {} }, %{ $job->{compiler_inputs} || {} } );
-        $run->{compiler_of_mutant}{ $mutant->id } = \%inputs if %inputs;
+        $run->{compiler_of_mutant}{ $mutant->id } = \%inputs if $original || %inputs;
     }
     my $code = !$run->{unbound_compiler}{ $mutant->id } && defined $job->{code} ? $job->{code} : q{};
     my ( $status, $reason, $detail ) = $verdict->@{qw(status reason detail)};
@@ -2378,6 +2459,10 @@ The mutants of every mutator decide whether a comment suppresses one, so the cho
 =head2 run
 
 Runs the measurement and returns a L<Test::Mutation::Result>.
+The optional C<detector_hints> argument maps mutant identifiers to project-relative test paths.
+When the runner resolves the full project with caching disabled, it can try a suggested covering test first if the harness rules allow it.
+The suggested test must establish C<Killed> against the current mutant.
+An inconclusive trial starts the ordinary test order from a clean workspace with the full timeout budget.
 The listener receives C<phase> with its name and time, C<resolved>, C<copy_started>, C<copy_finished>, C<baseline_started>, C<baseline_test>, C<baseline_finished>, C<mutants_started>, C<mutant_finished>, C<mutants_finished>, C<tick>, and C<finished>.
 The original C<analyzed>, C<baseline>, and C<mutant> notifications remain available.
 The final event contains the measurement tally.

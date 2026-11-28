@@ -3,24 +3,17 @@ use Test2::V0;
 use CPAN::Meta::YAML ();
 use Cwd              ();
 use ExtUtils::MM     ();
-use File::Basename   ();
-use File::Copy       ();
-use File::Path       ();
 use File::Temp       ();
 use JSON::PP         ();
 use lib 't/lib', 't/e2e/lib';
-use Fixture qw(copy_of write_file);
+use Fixture qw(write_file);
 use Gate;
-use Test::Mutation::Source ();
+use Test::Mutation::Mutator::Catalog ();
+use Test::Mutation::Settings         ();
 
-my $workflow    = CPAN::Meta::YAML->read('.github/workflows/release-gate.yml')->[0];
-my $jobs        = $workflow->{jobs};
-my $scratch     = Cwd::abs_path( File::Temp::tempdir( CLEANUP => 1 ) );
-my $tools       = "$scratch/tools";
-my $project     = "$scratch/project";
-my $runtime     = "$scratch/runner/self-runtime";
-my $installed   = 'installs/perl/pinned';
-my $interpreter = "$installed/perl/bin/perl";
+my $workflow = CPAN::Meta::YAML->read('.github/workflows/release-gate.yml')->[0];
+my $jobs     = $workflow->{jobs};
+my $scratch  = Cwd::abs_path( File::Temp::tempdir( CLEANUP => 1 ) );
 
 sub executable ( $path, $text ) {
     write_file( $path, $text );
@@ -28,49 +21,9 @@ sub executable ( $path, $text ) {
     return;
 }
 
-executable( "$scratch/bin/mise", <<'SH' );
-#!/bin/sh
-case "$1/$2" in
-    where/perl) printf '%s\n' "$MISE_DATA_DIR/installs/perl/pinned" ;;
-    which/perl) printf '%s\n' "$MISE_DATA_DIR/installs/perl/pinned/perl/bin/perl" ;;
-    *) exit 1 ;;
-esac
-SH
-File::Path::make_path("$tools/$installed/perl/bin");
-File::Copy::copy( $^X, "$tools/$interpreter" ) or die "copy the test Perl: $!";
-chmod oct '755', "$tools/$interpreter" or die "make the test Perl executable: $!";
-write_file( "$project/local/lib/perl5/Dependency.pm", "package Dependency; sub answer { 42 } 1;\n" );
-write_file( "$project/bin/mutation",                  <<'PERL' );
-use Dependency;
-print join("\n", @ARGV, Dependency::answer(), map { "$_=$ENV{$_}" } sort keys %ENV), "\n";
-PERL
-
 sub step ( $job, $pattern ) {
     my ($entry) = grep { ( $_->{run} || q{} ) =~ $pattern } ( $job->{steps} || [] )->@*;
     return $entry ? $entry->{run} : q{};
-}
-
-sub invocation ( $script, $shard, $directory = $project ) {
-    my $previous = Cwd::getcwd();
-    chdir $directory or die "enter $directory: $!";
-    local %ENV = (
-        %ENV,
-        PATH             => "$scratch/bin:$ENV{PATH}",
-        MISE_DATA_DIR    => $tools,
-        RUNNER_TEMP      => "$scratch/runner",
-        SHARD            => $shard,
-        SHARDS           => 8,
-        RUNNER_NAME      => "runner-$shard",
-        GITHUB_JOB       => "job-$shard",
-        MISE_JOB_VALUE   => "host-$shard",
-        CI_PROJECT_FLAGS => "part-$shard",
-    );
-    open my $output, q{-|}, '/bin/sh', '-eu', '-c', "exec 2>&1\n$script" or die "start the step: $!";
-    chomp( my @words = readline $output );
-    close $output;
-    my $exit = $? >> 8;
-    chdir $previous or die "return to $previous: $!";
-    return { exit => $exit, lines => \@words };
 }
 
 subtest 'the release rejects mutable sources and controllers outside main' => sub {
@@ -80,9 +33,14 @@ subtest 'the release rejects mutable sources and controllers outside main' => su
     }
     my $script = step( $jobs->{candidate}, qr/GITHUB_REF/ );
     ok length($script), 'the workflow validates the source before checking it out' or return;
-    local $ENV{GITHUB_REF} = 'refs/heads/main';
-    local $ENV{SOURCE_SHA} = 'a' x 40;
+    local $ENV{GITHUB_REF}    = 'refs/heads/main';
+    local $ENV{SOURCE_SHA}    = 'a' x 40;
+    local $ENV{REF_PROTECTED} = 'true';
     is system( 'bash', '-eu', '-c', $script ), 0, 'main can choose an immutable commit';
+    {
+        local $ENV{REF_PROTECTED} = 'false';
+        isnt system( 'bash', '-eu', '-c', $script ), 0, 'the controller requires protected main';
+    }
     {
         local $ENV{SOURCE_SHA} = 'main';
         isnt system( 'bash', '-eu', '-c', $script ), 0, 'a mutable candidate ref is refused';
@@ -91,24 +49,43 @@ subtest 'the release rejects mutable sources and controllers outside main' => su
     isnt system( 'bash', '-eu', '-c', $script ), 0, 'a workflow dispatched outside main is refused';
 };
 
-subtest 'all release shards restore the same measured tools and dependency bytes' => sub {
-    my $build   = $jobs->{'self-runtime'} || {};
-    my $measure = $jobs->{'self-measurement'};
-    is $measure->{needs}, 'self-runtime', 'the archive must be ready before any shard starts';
-    my $pack    = step( $build,   qr/tar -czf/ );
-    my $restore = step( $measure, qr/tar -xzf/ );
-    ok length($pack),    'the preparation job packs the shared runtime' or return;
-    ok length($restore), 'each shard restores the shared runtime'       or return;
-    invocation( $pack, 1 );
-    File::Path::remove_tree( $tools, "$project/local" );
-    invocation( $restore, 2 );
-    ok -x "$tools/$interpreter",                    'the restored target Perl is executable';
-    ok -f "$project/local/lib/perl5/Dependency.pm", 'the checkout receives the prepared dependency';
+subtest 'protected controller code verifies the local status before reading candidate files' => sub {
+    my $candidate = $jobs->{candidate};
+    is $candidate->{permissions}, { contents => 'read', statuses => 'read' },
+      'the identity job only reads commits and their statuses';
+    my @steps = $candidate->{steps}->@*;
+    my ($control) = grep { ( $steps[$_]{with}{path} || q{} ) eq 'controller' } keys @steps;
+    my ($check) =
+      grep { ( $steps[$_]{run} || q{} ) eq 'bash controller/xt/bin/verify-local-release-check' } keys @steps;
+    my ($source) = grep { ( $steps[$_]{with}{ref} || q{} ) eq q{${{ env.SOURCE_SHA }}} } keys @steps;
+    my $has_steps = defined $control && defined $check && defined $source;
+    ok $has_steps, 'the candidate job runs the controller and reads the candidate separately'
+      or return;
+    ok $control < $check && $check < $source, 'local status approval precedes every candidate checkout';
+    is $steps[$control]{with}{ref}, q{${{ github.workflow_sha }}},
+      'the verifier belongs to the calling workflow revision';
+    is $steps[$control]{with}{'persist-credentials'}, 'false', 'the controller checkout keeps no credential';
+    is $steps[$check]{env}{REPOSITORY_OWNER_ID}, q{${{ github.repository_owner_id }}},
+      'GitHub supplies the trusted account ID';
+    is $steps[$check]{env}{GH_TOKEN},       q{${{ github.token }}}, 'only the verifier step receives the status token';
+    is $steps[$check]{'continue-on-error'}, undef,                  'a failed status check stops the job';
 };
 
-subtest 'each measurement and build checks out the selected commit' => sub {
-    for my $job (qw(candidate self-runtime self-measurement compatibility release macos)) {
-        my ($checkout) = grep { ( $_->{uses} || q{} ) =~ m{\Aactions/checkout@} } ( $jobs->{$job}{steps} || [] )->@*;
+subtest 'the release configuration measures guarded exits' => sub {
+    my $config   = Test::Mutation::Settings::of_call( { root => q{.} } );
+    my $mutators = Test::Mutation::Mutator::Catalog::choose(
+        profile => $config->profile,
+        enable  => $config->enable,
+        disable => $config->disable
+    );
+    ok scalar( grep { $_->name eq 'early-exit' } @$mutators ), 'the project enables guarded exit removal';
+};
+
+subtest 'each platform and the identity job check out the selected commit' => sub {
+    for my $job (qw(candidate release macos)) {
+        my ($checkout) =
+          grep { ( $_->{uses} || q{} ) =~ m{\Aactions/checkout@} && ( $_->{with}{path} || q{} ) ne 'controller' }
+          ( $jobs->{$job}{steps} || [] )->@*;
         is $checkout->{with}{ref},                   q{${{ env.SOURCE_SHA }}}, "$job reads the selected commit";
         is $checkout->{with}{'persist-credentials'}, 'false', "$job leaves no credentials in the checkout";
     }
@@ -119,7 +96,7 @@ subtest 'candidate tools stay out of the shared Actions cache' => sub {
         grep { ( $_->{uses} || q{} ) =~ m{\Ajdx/mise-action@} }
           $_->{steps}->@*
     } values %$jobs;
-    Gate::checked( 'candidate tool installations', scalar @tools, at_least => 4 );
+    is scalar @tools,     2,       'both distribution builds install the pinned tools';
     is $_->{with}{cache}, 'false', 'the tool installation reads and writes no shared cache' for @tools;
 };
 
@@ -144,11 +121,20 @@ subtest 'the candidate rejects a different version or checkout' => sub {
     isnt system( 'bash', '-eu', '-c', $script ), 0, 'a different release version is refused';
 };
 
-subtest 'the packaged command runs after disttest on both release systems' => sub {
+subtest 'the hosted gate builds and installs the selected distribution on both platforms' => sub {
+    is [ sort keys %$jobs ], [qw(candidate macos release verified)],
+      'hosted jobs check identity, build twice and verify the artifact';
     for my $job (qw(release macos)) {
-        my @runs = map { $_->{run} } grep { exists $_->{run} } $jobs->{$job}{steps}->@*;
-        is [ @runs[ -2, -1 ] ], [ 'mise x -- make disttest', 'mise run verify-install' ],
-          "$job checks an installation of the archive that passed disttest";
+        is $jobs->{$job}{needs}, 'candidate', "$job waits for the local checks";
+        my @commands = map { $_->{run} } grep { ( $_->{run} || q{} ) =~ /\bmise\s/ } $jobs->{$job}{steps}->@*;
+        is \@commands, [ 'mise run setup', 'mise run dist', 'mise run verify-install' ],
+          "$job builds and installs the archive";
+        my ($install) = grep { ( $_->{run} || q{} ) eq 'mise run verify-install' } $jobs->{$job}{steps}->@*;
+        my $archive =
+          $job eq 'release'
+          ? q{${{ steps.tested.outputs.archive }}}
+          : q{Test-Mutation-${{ needs.candidate.outputs.version }}.tar.gz};
+        is $install->{env}{TEST_MUTATION_DISTRIBUTION}, $archive, "$job installs the named candidate archive";
     }
 };
 
@@ -171,6 +157,13 @@ subtest 'the verified output waits for both platforms and names one immutable ar
     is $download->{with}{'digest-mismatch'}, 'error', 'a transport digest mismatch fails verification';
     my ($controller) = grep { ( $_->{with}{path} || q{} ) eq 'controller' } ( $verified->{steps} || [] )->@*;
     is $controller->{with}{ref}, q{${{ github.workflow_sha }}}, 'archive verification runs the trusted controller';
+    my $recheck = $verified->{steps}[-1];
+    is $recheck->{run}, 'bash controller/xt/bin/verify-local-release-check',
+      'a status change during either build can still stop publication';
+    is $verified->{permissions}{statuses}, 'read', 'the artifact verifier reads commit statuses';
+    is $recheck->{env}{REPOSITORY_OWNER_ID}, q{${{ github.repository_owner_id }}},
+      'the artifact verifier uses the same account identity';
+    is $recheck->{env}{GH_TOKEN}, q{${{ github.token }}}, 'the final check receives a read token';
 };
 
 subtest 'a retried verification rejects artifacts from other builds' => sub {
@@ -200,62 +193,6 @@ subtest 'a retried verification rejects artifacts from other builds' => sub {
         local $ENV{RECEIPT} = JSON::PP->new->encode( { %receipt, @$mismatch } );
         isnt system( 'bash', '-euo', 'pipefail', '-c', $script ), 0, 'a conflicting receipt is rejected';
     }
-};
-
-subtest 'the release test rejects shard numbers in the measured environment' => sub {
-    write_file( "$runtime/perl-path", "$interpreter\n" ) unless -f "$runtime/perl-path";
-    my $script = step( $jobs->{'self-measurement'}, qr/--shard\b/ );
-    for my $part ( 1, 2 ) {
-        my $expected = [
-            '--no-cache', '--shard', "$part/8", '--format', 'json', '--format', 'terminal', 42, 'LC_ALL=C',
-            "PATH=$tools/$installed/perl/bin:$project/local/bin:/usr/bin:/bin",
-            "PERL5LIB=$project/local/lib/perl5", 'TZ=UTC'
-        ];
-        my $leaking = $script =~ s/LC_ALL=C/SHARD=$part LC_ALL=C/r;
-        isnt invocation( $leaking, $part ), { exit => 0, lines => $expected },
-          'inheriting the scheduler index changes the measured inputs';
-        is invocation( $script, $part ), { exit => 0, lines => $expected },
-          "shard $part passes its index only as a command argument";
-    }
-};
-
-subtest 'a failed baseline keeps its test name and TAP in the shard log' => sub {
-    my $fixture = copy_of('calc');
-    symlink File::Basename::dirname($^X) . '/../lib', "$tools/$installed/perl/lib"
-      or die "link the runtime libraries: $!";
-    for my $path (qw(bin lib/Test local)) {
-        symlink Cwd::abs_path($path), "$fixture/$path" or die "link $path to the test checkout: $!";
-    }
-    write_file( "$fixture/t/broken.t", 'print "1..1\nnot ok 1 - unmodified assertion\n";' );
-    my $run = invocation( step( $jobs->{'self-measurement'}, qr/--shard\b/ ), 3, $fixture );
-    is $run->{exit}, 3, 'the measurement step retains the baseline failure status';
-    my $log = join "\n", $run->{lines}->@*;
-    like $log, qr{^  t/broken\.t$}m,                      'the log names the failed test';
-    like $log, qr/^\s*not ok 1 - unmodified assertion$/m, 'the log shows the failed assertion';
-    my $json = Test::Mutation::Source::read_bytes("$fixture/mutation-report/mutation.json");
-    is JSON::PP::decode_json($json)->{testMutation}{baselineFailures}, ['t/broken.t'],
-      'the JSON report records the same baseline failure';
-};
-
-subtest 'a failed shard uploads its JSON and blocks the distribution' => sub {
-    my $shard     = $jobs->{'self-measurement'};
-    my ($measure) = grep { ( $_->{run}  || q{} ) =~ /--shard\b/ } $shard->{steps}->@*;
-    my ($upload)  = grep { ( $_->{uses} || q{} ) =~ m{\Aactions/upload-artifact@} } $shard->{steps}->@*;
-    ok $measure,       'the shard runs the measurement' or return;
-    ok $upload,        'the shard uploads its report'   or return;
-    ok $measure->{id}, 'the upload can identify the measurement step';
-    my $outcome = 'steps.' . ( $measure->{id} || q{} ) . '.outcome';
-    is $upload->{if}, "\${{ !cancelled() && ($outcome == 'success' || $outcome == 'failure') }}",
-      'completed measurements upload after success or failure and skip cancellation and unstarted measurements';
-    is $upload->{with}{path}, 'mutation-report/mutation.json', 'the upload retains the report from the measurement';
-    is $upload->{with}{'if-no-files-found'}, 'error',          'a successful measurement must produce its report';
-
-    for my $entry ( $shard, $measure, $upload ) {
-        is $entry->{'continue-on-error'} || 'false', 'false', 'measurement and upload failures fail the shard';
-    }
-    is $measure->{if}, undef, 'a configured shard runs once setup succeeds';
-    like $jobs->{release}{needs}, qr/\bself-measurement\b/, 'the distribution waits for the whole matrix';
-    is $jobs->{release}{if}, undef, 'GitHub requires every prerequisite to succeed before building the distribution';
 };
 
 Gate::checked( 'release jobs', scalar keys %$jobs, at_least => 4 );

@@ -88,6 +88,8 @@ my $DOCUMENT = Dict [
         baselineFailures  => ArrayRef [Str],
         tests             => ArrayRef [ Dict [ name => Str, duration => Num, neutral => Optional [$FLAG] ] ],
         stats             => Dict [ map { $_ => PositiveOrZeroInt } values %WORK_KEY ],
+
+        compilerInputProtocol => Optional [PositiveInt],
     ],
 ];
 
@@ -169,6 +171,9 @@ sub _facts ($result) {
             } $result->tests->@*
         ],
         stats => { map { $WORK_KEY{$_} => 0 + $result->stats->{$_} } keys %WORK_KEY },
+        defined $result->compiler_input_protocol
+        ? ( compilerInputProtocol => 0 + $result->compiler_input_protocol )
+        : (),
     };
 }
 
@@ -323,6 +328,8 @@ sub _result ($document) {
         started            => $facts->{started},
         finished           => $facts->{finished},
         stats              => { map { $_ => $facts->{stats}{ $WORK_KEY{$_} } } keys %WORK_KEY },
+
+        compiler_input_protocol => $facts->{compilerInputProtocol},
     );
 }
 

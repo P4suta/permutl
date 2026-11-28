@@ -6,6 +6,7 @@ use Cwd         ();
 use Digest::SHA ();
 use Time::HiRes ();
 use lib 't/lib';
+use Bounded;
 use Raised;
 use lib 't/e2e/lib';
 use Fixture qw(run_fixture write_file);
@@ -32,11 +33,40 @@ write_file( "$root/data.txt", "first\n" );
 chmod 0755, "$root/data.txt" or die $!;
 isnt Test::Mutation::Store::Key::tree( $root, ['A.pm'] ), $original, 'an executable bit changes the project input';
 
+subtest 'a project or workspace fingerprint visits each included file once' => sub {
+    my $file = Test::Mutation::Store::Key->can('file');
+    my @visited;
+    no warnings 'redefine';
+    local *Test::Mutation::Store::Key::file = sub ($path) {
+        push @visited, $path;
+        return $file->($path);
+    };
+    my $project = Test::Mutation::Store::Key::tree( $root, ['A.pm'] );
+    is \@visited, ["$root/data.txt"], 'the project scans its data file once with the default output policy';
+    @visited = ();
+    my $copy = Test::Mutation::Store::Key::workspace( $root, ['A.pm'], [] );
+    is \@visited, ["$root/data.txt"], 'the workspace scans its data file once without a separate original';
+    is $copy,     $project,           'the same data has the same fingerprint in either workspace';
+};
+
 my $env = Test::Mutation::Store::Key::environment( { ANSWER => '1', SHLVL => '2' } );
 is Test::Mutation::Store::Key::environment( { ANSWER => '1', SHLVL => '3' } ), $env, 'shell nesting is volatile';
 isnt Test::Mutation::Store::Key::environment( { ANSWER => '2', SHLVL => '2' } ), $env, 'a test can read any variable';
 isnt Test::Mutation::Store::Key::environment( { ANSWER => q{} } ), Test::Mutation::Store::Key::environment( {} ),
   'an empty variable differs from an absent variable';
+
+subtest 'a search directory retains its identity when missing parents appear' => sub {
+    my $project = Cwd::abs_path( File::Temp::tempdir( CLEANUP => 1 ) );
+    my $library = "$project/dependencies/vendor/lib";
+    my $search  = { PERL5LIB => $library };
+    my ( $ended, $missing ) =
+      Bounded::ended( 3, sub { return Test::Mutation::Store::Key::environment( $search, $project ) } );
+    ok $ended, 'looking up a missing directory reaches an existing ancestor';
+    bail_out('the missing library search path did not resolve') unless $ended;
+    write_file( "$library/Module.pm", "1;\n" );
+    is Test::Mutation::Store::Key::environment( $search, $project ), $missing,
+      'creating the library directory preserves its path in the environment fingerprint';
+};
 
 subtest 'search paths inside a checkout compare by their relative names' => sub {
     my $input = sub ( $root, @dirs ) {
@@ -48,6 +78,21 @@ subtest 'search paths inside a checkout compare by their relative names' => sub 
       'a project mounted at the filesystem root retains its library search path after relocation';
     isnt $input->( '/b', '/shared', '/b/lib', '/b' ),         $first, 'the order remains significant';
     isnt $input->( '/b', '/shared', '/b',     '/b-old/lib' ), $first, 'an adjacent directory stays external';
+
+    my $checkout = File::Temp::tempdir( CLEANUP => 1 );
+    mkdir "$checkout/lib" or die "create project library: $!";
+    is $input->( $checkout, "$checkout/lib" ), '7db3e51c744ef23390d35f375428ecf0e9b99254bf401c9ed854356180e79e12',
+      'the project library matches the environment fingerprint used by saved shards';
+};
+
+subtest 'an unresolved search directory keeps its checkout location' => sub {
+    my @keys;
+    for ( 1 .. 2 ) {
+        my $project = Cwd::abs_path( File::Temp::tempdir( CLEANUP => 1 ) );
+        symlink 'missing/parent/lib', "$project/library" or die "link missing library: $!";
+        push @keys, Test::Mutation::Store::Key::environment( { PERL5LIB => "$project/library" }, $project );
+    }
+    isnt $keys[0], $keys[1], 'dangling library links in different checkouts have different fingerprints';
 };
 
 subtest 'a search directory outside the checkout keeps its location' => sub {
@@ -59,6 +104,11 @@ subtest 'a search directory outside the checkout keeps its location' => sub {
         symlink 'bin',               "$base/$site/repo/alias"     or die "link local search directory: $!";
         symlink "$base/first/tools", "$base/$site/repo/shared"    or die "link shared search directory: $!";
     }
+    my $alias = "$base/linked-project";
+    symlink "$base/first/repo", $alias or die "link project root: $!";
+    is Test::Mutation::Store::Key::environment( { PERL5LIB => "$alias/bin" }, $alias ),
+      Test::Mutation::Store::Key::environment( { PERL5LIB => "$base/second/repo/bin" }, "$base/second/repo" ),
+      'a library in a checkout reached through a symlink relocates with the project';
     for my $name (qw(PATH PERL5LIB PERLLIB)) {
         my $key = sub ( $site, $entry ) {
             my $project = "$base/$site/repo";

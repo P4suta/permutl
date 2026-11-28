@@ -61,19 +61,22 @@ sub activate {
     my ( $spec, $record_dir ) = @_;
     return if $STATE{active};
 
-    my %by_base;
+    my ( %by_base, %disk_files );
     my $index = 0;
     for my $target ( @{ $spec->{targets} } ) {
         $target->{index} = $index++;
         my @stat = stat $target->{original};
         $target->{device} = $stat[0];
         $target->{inode}  = $stat[1];
+        my $base = _basename( $target->{original} );
+        push @{ $disk_files{$base} }, [ $target->{original}, @stat[ 0, 1 ] ] if @stat;
         if ( defined $target->{outside} ) {
             my @outside = stat $target->{outside};
             $target->{outside_device} = $outside[0];
             $target->{outside_inode}  = $outside[1];
+            push @{ $disk_files{$base} }, [ $target->{outside}, @outside[ 0, 1 ] ] if @outside;
         }
-        push @{ $by_base{ _basename( $target->{original} ) } }, $target;
+        push @{ $by_base{$base} }, $target;
     }
 
     %STATE = (
@@ -84,11 +87,16 @@ sub activate {
         trace_eval  => $spec->{trace_eval},
         targets     => $spec->{targets},
         by_base     => \%by_base,
+        disk_files  => \%disk_files,
         placed      => $spec->{placed},
         by_path     => {},
         record_dir  => scalar _untainted($record_dir),
     );
 
+    my @directory = stat q{.};
+    $STATE{directory} = [ @directory[ 0, 1 ] ] if @directory;
+    my @program = stat $0;
+    $STATE{program} = [ _basename($0), @program[ 0, 1 ] ] if @program;
     if ( $spec->{includes} ) {
         require Cwd;
         _include_directories();
@@ -196,19 +204,23 @@ sub _target_at {
     for my $target ( @{$candidates} ) {
         return $target if defined $target->{inode} && $stat[1] == $target->{inode} && $stat[0] == $target->{device};
     }
-    my $text    = _slurp($path);
-    my @equal   = grep { $text eq _slurp( $_->{original} ) } @{$candidates};
+    my $text = _slurp($path);
+    return unless defined $text;
+    my @equal = grep {
+        my $original = _slurp( $_->{original} );
+        defined $original && $text eq $original;
+    } @{$candidates};
     my ($named) = grep { substr( "/$_->{original}", -length("/$file") ) eq "/$file" } @equal;
     return $named || $equal[0];
 }
 
 sub _slurp {
     my ($path) = @_;
-    open my $handle, '<:raw', $path or return q{};
+    open my $handle, '<:raw', $path or return;
     local $/ = undef;
     my $content = <$handle>;
-    close $handle or return q{};
-    return defined $content ? $content : q{};
+    close $handle or return;
+    return $content;
 }
 
 sub _serve {
@@ -404,11 +416,25 @@ sub _breakable_lines {
     return grep { defined $lines->[$_] && int( $lines->[$_] ) != int "$lines->[$_]" } 1 .. $#{$lines};
 }
 
+sub _relative_disk_match {
+    my ( $path, $name, $device, $inode ) = @_;
+    my $initial   = $STATE{directory} or return 0;
+    my @directory = stat q{.};
+    return 0 if !@directory || $directory[0] != $initial->[0] || $directory[1] != $initial->[1];
+    my $suffix = q{/} . join q{/}, grep { length && $_ ne q{.} } split m{/}, $path;
+    my $peers  = $STATE{disk_files}{$name} || [];
+    return !grep { ( q{/} . $_->[0] ) =~ /\Q$suffix\E\z/ && ( $_->[1] != $device || $_->[2] != $inode ) } @{$peers};
+}
+
 sub _loaded_from_disk {
     my ( $target, $device, $inode ) = @_;
     return 0 if !defined $inode;
-    for my $path ( grep { defined && !ref } values(%INC), $0 ) {
-        next if _basename($path) ne _basename( $target->{original} );
+    my $name    = _basename( $target->{original} );
+    my $program = $STATE{program};
+    return 1 if $program && $program->[0] eq $name && $program->[1] == $device && $program->[2] == $inode;
+    for my $path ( grep { defined && !ref } values %INC ) {
+        next if _basename($path) ne $name;
+        next if $path !~ m{\A/} && !_relative_disk_match( $path, $name, $device, $inode );
         my @stat = stat $path or next;
         return 1 if $stat[1] == $inode && $stat[0] == $device;
     }
@@ -432,8 +458,8 @@ sub finish {
                 next;
             }
             if ( _loaded_from_disk( $target, $target->{device}, $target->{inode} ) ) {
-                if   ( $STATE{placed} ) { _record( 'blind',  $target->{original} ) }
-                else                    { _record( 'around', $target->{original} ) }
+                if ( $STATE{placed} ) { _record( 'blind', $target->{original}, 'loaded-at-exit' ) }
+                else                  { _record( 'around', $target->{original} ) }
             }
             next;
         }
@@ -472,6 +498,8 @@ C<begin> carries 1 when line tracing is active.
 C<seen> names a target that compiled.
 The optional C<opened> and C<failed> fields record opening the source and a failed load.
 C<blind> names a target that compiled without an available line tracer.
+Its optional C<loaded-at-exit> field identifies a file found in C<%INC> or as the main program at process exit.
+The reader uses file coverage for that observation unless the same process already recorded compilation of the target.
 C<around> records loading the target around the hook and C<outside> records loading the project file outside its copy.
 C<error> carries the target and the diagnostic from the shim.
 C<hit> carries a target and a line that ran.

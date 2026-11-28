@@ -57,6 +57,7 @@ sub _is_keyword ($token) {
 
 sub key_of ($token) {
     my $class = ref($token) =~ s/\APPI::Token:://r;
+    return 'statement ...' if $class eq 'Operator' && $token->content eq '...' && !$token->sprevious_sibling;
     return 'operator ' . $token->content . _arity($token) if $class eq 'Operator';
     return $class                                         if $class ne 'Word';
     return _is_keyword($token) ? 'word ' . $token->content : 'Word';

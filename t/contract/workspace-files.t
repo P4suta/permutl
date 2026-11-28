@@ -6,12 +6,13 @@ use File::Temp ();
 use Fcntl      qw(:flock);
 use POSIX      ();
 
-our ( $write_fault, $after_read, $close_fault );    ## no critic (Variables::ProhibitPackageVars)
+our ( $write_fault, $read_fault, $after_read, $close_fault );    ## no critic (Variables::ProhibitPackageVars)
+our $io_package = 'Test::Mutation::Workspace';                   ## no critic (Variables::ProhibitPackageVars)
 
 BEGIN {
     no warnings 'once';
     *CORE::GLOBAL::syswrite = sub : prototype(*$;$$) {
-        if ( defined $write_fault && caller eq 'Test::Mutation::Workspace' ) {
+        if ( defined $write_fault && caller eq $io_package ) {
             $! = 5;    ## no critic (Variables::RequireLocalizedPunctuationVars)
             return $write_fault eq 'short' ? 1 : undef;
         }
@@ -20,6 +21,10 @@ BEGIN {
         return CORE::syswrite( $_[0], $_[1] );
     };
     *CORE::GLOBAL::sysread = sub : prototype(*\$$;$) {
+        if ( $read_fault && caller eq $io_package ) {
+            $! = 5;    ## no critic (Variables::RequireLocalizedPunctuationVars)
+            return;
+        }
         my $count =
           @_ == 4 ? CORE::sysread( $_[0], ${ $_[1] }, $_[2], $_[3] ) : CORE::sysread( $_[0], ${ $_[1] }, $_[2] );
         $after_read->() if $after_read && caller eq 'Test::Mutation::Workspace';
@@ -40,6 +45,7 @@ BEGIN {
 }
 
 use Test::Mutation::Workspace;
+use Test::Mutation::Report::Publication;
 
 my $parent  = Cwd::abs_path( File::Temp::tempdir( CLEANUP => 1 ) );
 my $project = File::Temp::tempdir( CLEANUP => 1 );
@@ -56,6 +62,25 @@ sub workspaces () {
     opendir my $entries, $parent or die $!;
     return [ sort grep { /\Amutation-/ } readdir $entries ];
 }
+
+subtest 'failed reads and partial writes cannot certify report files' => sub {
+    my $root    = File::Temp::tempdir( CLEANUP => 1 );
+    my $digests = { 'mutation.json' => 'b' x 64 };
+    local $io_package = 'Test::Mutation::Report::Publication';
+    Test::Mutation::Report::Publication::record( $root, $root, $digests );
+    {
+        local $read_fault = 1;
+        my $found;
+        is warnings { $found = Test::Mutation::Report::Publication::outputs( $root, q{.} ) }, [],
+          'a read error leaves the recorded files in the measurement without warnings';
+        is $found, {}, 'the failed read identifies no generated files';
+    }
+    for my $fault (qw(short failed)) {
+        local $write_fault = $fault;
+        like dies { Test::Mutation::Report::Publication::record( $root, $root, $digests ) },
+          qr/\Acannot write .*\.test-mutation-outputs: /, "a $fault write prevents successful publication";
+    }
+};
 
 subtest 'acquisition either returns a complete workspace or removes the partial result' => sub {
     like dies { Test::Mutation::Workspace::acquire( [] ) }, qr/type constraint "Str" [(]in \$_\[0\][)]/,

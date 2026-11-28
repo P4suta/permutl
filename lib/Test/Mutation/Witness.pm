@@ -1,7 +1,9 @@
 package Test::Mutation::Witness;
 use v5.36;
+use Digest::SHA            ();
 use Encode                 ();
 use Fcntl                  ();
+use File::Basename         ();
 use POSIX                  ();
 use Types::Standard        qw(FileHandle Int Maybe Str StrMatch);
 use Types::Common::Numeric qw(PositiveOrZeroInt PositiveInt);
@@ -15,13 +17,13 @@ signature_for insert =>
 
 sub insert ( $text, $offset, $generation, $index, $records, $descriptor ) {
     my $package   = "Test::Mutation::Shim::G$generation";
+    my $work      = File::Basename::dirname($records);
+    my $trace     = trace_package($work);
+    my $preloaded = _preloaded( $generation, $work );
     my $directory = _directory( $generation, $records, $descriptor );
     my $statement =
-        'UNITCHECK{package DB;unless(defined&'
-      . $package
-      . '::seen&&'
-      . $package
-      . "::seen($index)){"
+        "UNITCHECK{package DB;unless(defined&${trace}::seen?${trace}::seen($index):"
+      . "$preloaded&&defined&${package}::seen&&${package}::seen($index)){"
       . $directory
       . 'if(CORE::open(my$h,q{>>:raw},"$d/blind-$$.rec")){CORE::syswrite($h,"blind\t'
       . $index
@@ -30,9 +32,18 @@ sub insert ( $text, $offset, $generation, $index, $records, $descriptor ) {
     return $text;
 }
 
-sub _literal ($bytes) {
-    my $hex = unpack 'H*', utf8::is_utf8($bytes) ? Encode::encode_utf8($bytes) : $bytes;
+sub _path_bytes ($path) {
+    return utf8::is_utf8($path) ? Encode::encode_utf8($path) : $path;
+}
+
+sub _literal ($path) {
+    my $hex = unpack 'H*', _path_bytes($path);
     return 'CORE::pack(q{H*},q{' . $hex . '})';
+}
+
+sub _preloaded ( $generation, $work ) {
+    my $module = "Test/Mutation/Shim/G$generation.pm";
+    return '($INC{q{' . $module . '}}||q{}) eq ' . _literal("$work/shim/$module");
 }
 
 sub _directory ( $generation, $records, $descriptor ) {
@@ -86,22 +97,32 @@ signature_for trace => (
 sub trace ($arg) {
     my $generation = $arg->generation;
     my $package    = "Test::Mutation::Shim::G$generation";
-    my $shim       = _literal( $arg->work . '/shim' );
+    my $trace      = trace_package( $arg->work );
+    my $preloaded  = _preloaded( $generation, $arg->work );
     my $statement =
-        'BEGIN{package DB;unless(defined&'
+        'BEGIN{package DB;my$t;if('
+      . $preloaded
+      . '){$t=\&'
       . $package
-      . '::trace_source){local@INC=('
-      . $shim
-      . ',@INC);CORE::require(q{Test/Mutation/Shim/G'
-      . $generation
-      . '.pm})}'
-      . _directory( $generation, $arg->work . '/records', $arg->descriptor )
-      . $package
-      . '::trace_source('
+      . '::trace_source}'
+      . 'else{unless(defined&'
+      . $trace
+      . '::trace_source){my$f='
+      . _literal( $arg->work . '/trace.pl' ) . ';'
+      . 'local$INC{$f};delete$INC{$f};CORE::require($f)}$t=\&'
+      . $trace
+      . '::trace_source}'
+      . _directory( $generation, $arg->work . '/records', $arg->descriptor ) . '$t->('
       . join( ',', $arg->index, _literal( $arg->target ), '__FILE__', '$d', $arg->line . '-__LINE__' ) . ')}';
     my $text = $arg->text;
     substr $text, $arg->offset, 0, $statement;
     return $text;
+}
+
+signature_for trace_package => ( positional => [Str], returns => Str );
+
+sub trace_package ($work) {
+    return 'Test::Mutation::Shim::Trace_' . Digest::SHA::sha256_hex( _path_bytes($work) );
 }
 
 signature_for reserve => ( positional => [Str], returns => FileHandle );
@@ -150,6 +171,10 @@ A package with an autoloader can resolve the call at run time.
 =head2 trace
 
 Places a line tracer before the first statement of a diagnostic copy.
+
+=head2 trace_package
+
+Returns the package name for the tracer in a single workspace.
 
 =head2 reserve
 

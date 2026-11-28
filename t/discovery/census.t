@@ -131,6 +131,47 @@ subtest 'the gate rejects an undecided key, a declined key with a mutant, and a 
     is Census::undecided( \%refused, {} ), [], 'a key whose changes the generator refuses with a rule has its reason';
 };
 
+my $account_lookups = <<'CODE';
+sub home { (getpwnam $_[0])[7] }
+sub uid { scalar getpwnam $_[0] }
+CODE
+
+subtest 'account lookups by name return a record or a user ID' => sub {
+    my $census = census_of( $account_lookups . 'sub names { my %h = (getpwnam => 1); $obj->getpwnam() }' );
+    is $census->{observed}{'word getpwnam'},     2, 'the two calls count under the built-in name';
+    is $census->{claimed}{'word getpwnam'} || 0, 0, 'neither lookup has a replacement function';
+    like Census::declined()->{'word getpwnam'}, qr/account/, 'the reason identifies the account lookup';
+};
+
+subtest 'a range opens an author section and an ellipsis raises an exception' => sub {
+    my $source = Oracle::file_source('t/corpus/findings/AuthorSection.pm');
+    my $census = census_of( $source->text );
+    for my $key ( 'operator ...', 'statement ...' ) {
+        is [ $census->{observed}{$key}, $census->{claimed}{$key} ], [ 1, 1 ], "one mutant covers $key";
+    }
+    my $root = File::Temp::tempdir( CLEANUP => 1 );
+    write_file( "$root/lib/AuthorSection.pm", $source->text );
+    write_file( "$root/t/authors.t",          <<'TEST' );
+use Test::More tests => 2;
+use AuthorSection;
+is_deeply AuthorSection::authors('before', '=head1 AUTHORS', 'author', '=head1 SEE ALSO', 'after'),
+  ['author'], 'the author line lies between the headings';
+eval { AuthorSection::unfinished() };
+like $@, qr/Unimplemented/, 'an unfinished section raises the Perl exception';
+TEST
+    my @changes = grep {
+             ( $_->mutator eq 'range-boundary' && $_->original eq '...' )
+          || ( $_->mutator eq 'statement-removal' && $_->original eq '...;' )
+    } Test::Mutation::mutants( root => $root, profile => 'extended' )->@*;
+    is scalar @changes, 2, 'the range endpoint and the unimplemented statement have distinct mutants' or return;
+    my ($result) =
+      run_fixture( $root, cache => 0, jobs => 1, profile => 'extended', mutant => [ map { $_->id } @changes ] );
+    is $result->baseline_failures, [], 'the original returns the author and throws for the unfinished section';
+    is [ map { [ $_->@{qw(status by)} ] } $result->entries->@* ],
+      [ [ 'Killed', 't/authors.t' ], [ 'Killed', 't/authors.t' ] ],
+      'tests detect ending the section immediately and omitting the exception';
+};
+
 subtest 'the parent process ID is measured in statement and value contexts' => sub {
     my $source = Oracle::file_source('t/corpus/findings/ParentProcess.pm');
     my $census = census_of( $source->text );
@@ -203,7 +244,7 @@ subtest 'the census rejects a pattern that the analysis leaves out without a cou
 };
 
 # The seed shows each declined construct that the corpus lacks, in a declaration that no mutator changes.
-my $SEED = $tied_handle . <<'CODE';
+my $SEED = $account_lookups . $tied_handle . <<'CODE';
 my ( $x, @list ) = ( \&code, [ 1, 2 ] );
 print { $x->[0] } "@list$#list";
 LABEL: for my $item ( @{ $x }, $_ ) { next LABEL }

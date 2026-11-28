@@ -2,7 +2,7 @@ package Test::Mutation::Store::History;
 use v5.36;
 use Cwd              ();
 use Cpanel::JSON::XS ();
-use Types::Standard  qw(ArrayRef Bool Dict HashRef InstanceOf Maybe Num Optional Str Undef);
+use Types::Standard  qw(ArrayRef Bool Dict HashRef InstanceOf Maybe Num Str Undef);
 use Type::Params     qw(signature_for);
 use Test::Mutation::Diff;
 use Test::Mutation::Store;
@@ -17,12 +17,14 @@ my $JSON   = Cpanel::JSON::XS->new->canonical;
 signature_for record => (
     positional => [
         $CONFIG, InstanceOf ['Test::Mutation::Result'],
-        Bool,    Optional [ Maybe [ Dict [ completed => Num, measured => HashRef [Num] ] ] ]
+        Bool,
+        Maybe [ Dict [ completed => Num, measured => HashRef [Num] ] ],
+        { default => undef }
     ],
     returns => Undef,
 );
 
-sub record ( $config, $result, $anchor, $merge = undef ) {
+sub record ( $config, $result, $anchor, $merge ) {
     return unless $config->cache;
     my $db       = Test::Mutation::Store::database( Test::Mutation::Store::path($config) );
     my $complete = !defined $result->shard && !defined $result->interrupted && !$result->baseline_failures->@*;
@@ -57,7 +59,7 @@ sub record ( $config, $result, $anchor, $merge = undef ) {
                 $write->execute( $run, $order++, $id, $path, $sources{$path}, $entry->{status},
                     $JSON->encode( \%facts ) );
             }
-            return 1;
+            return;
         }
     );
     return;

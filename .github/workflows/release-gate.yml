@@ -51,14 +51,32 @@ jobs:
     name: Check the candidate commit and version
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    permissions:
+      contents: read  # Read the protected controller and both Git trees.
+      statuses: read  # Read the local release result for the selected commit.
     outputs:
       source_sha: ${{ steps.identity.outputs.source_sha }}
       version: ${{ steps.identity.outputs.version }}
     steps:
       - name: Require a main controller and an immutable source
+        env:
+          REF_PROTECTED: ${{ github.ref_protected }}
         run: |
           test "$GITHUB_REF" = refs/heads/main
+          test "$REF_PROTECTED" = true
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: controller
+          sparse-checkout: xt/bin/verify-local-release-check
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      - name: Require local release checks before building
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY_OWNER_ID: ${{ github.repository_owner_id }}
+        run: bash controller/xt/bin/verify-local-release-check
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ env.SOURCE_SHA }}
@@ -73,107 +91,9 @@ jobs:
           [[ -z "$VERSION" || "$VERSION" == "$version" ]] || exit 1
           printf 'source_sha=%s\nversion=%s\n' "$SOURCE_SHA" "$version" >> "$GITHUB_OUTPUT"
 
-  self-runtime:
-    name: Prepare the self-measurement runtime
-    needs: candidate
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    env:
-      MISE_DATA_DIR: /tmp/test-mutation-release-tools
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ env.SOURCE_SHA }}
-          persist-credentials: false
-      - uses: jdx/mise-action@924e7c586e33d7d4bae9c14e26c5d22e2beb6e78 # v5.3.0
-        with:
-          cache: false
-      - run: sudo apt-get install --yes --no-install-recommends zlib1g-dev
-      - run: mise run setup
-      - name: Pack Perl and the installed dependencies
-        run: |
-          runtime="$RUNNER_TEMP/self-runtime"
-          mkdir -p "$runtime"
-          install="$(mise where perl)"
-          perl="$(mise which perl)"
-          case "$install" in "$MISE_DATA_DIR"/*) ;; *) exit 1 ;; esac
-          case "$perl" in "$install"/*) ;; *) exit 1 ;; esac
-          tar -czf "$runtime/perl.tar.gz" -C "$MISE_DATA_DIR" "${install#"$MISE_DATA_DIR"/}"
-          tar -czf "$runtime/libraries.tar.gz" local
-          printf '%s\n' "${perl#"$MISE_DATA_DIR"/}" > "$runtime/perl-path"
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: self-runtime
-          path: ${{ runner.temp }}/self-runtime
-          if-no-files-found: error
-          retention-days: 1
-
-  self-measurement:
-    name: Self measurement ${{ matrix.shard }}
-    runs-on: ubuntu-24.04
-    needs: self-runtime
-    env:
-      MISE_DATA_DIR: /tmp/test-mutation-release-tools
-    timeout-minutes: 360
-    strategy:
-      fail-fast: false
-      max-parallel: 4
-      matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8]
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ env.SOURCE_SHA }}
-          persist-credentials: false
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: self-runtime
-          path: ${{ runner.temp }}/self-runtime
-      - name: Restore the prepared runtime
-        run: |
-          mkdir -p "$MISE_DATA_DIR"
-          tar -xzf "$RUNNER_TEMP/self-runtime/perl.tar.gz" -C "$MISE_DATA_DIR"
-          tar -xzf "$RUNNER_TEMP/self-runtime/libraries.tar.gz"
-      - name: Measure one part of the inventory
-        id: measure
-        env:
-          SHARD: ${{ matrix.shard }}
-          SHARDS: ${{ strategy.job-total }}
-        run: |
-          IFS= read -r executable < "$RUNNER_TEMP/self-runtime/perl-path"
-          perl="$MISE_DATA_DIR/$executable"
-          env -i LC_ALL=C TZ=UTC PATH="${perl%/*}:$PWD/local/bin:/usr/bin:/bin" PERL5LIB="$PWD/local/lib/perl5" \
-            "$perl" -Ilib bin/mutation --no-cache --shard "$SHARD/$SHARDS" --format json --format terminal
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: ${{ !cancelled() && (steps.measure.outcome == 'success' || steps.measure.outcome == 'failure') }}
-        with:
-          name: self-mutation-${{ matrix.shard }}
-          path: mutation-report/mutation.json
-          if-no-files-found: error
-          retention-days: 7
-
-  compatibility:
-    name: Engine, interpreters and real distributions
-    needs: candidate
-    runs-on: ubuntu-24.04
-    timeout-minutes: 360
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ env.SOURCE_SHA }}
-          persist-credentials: false
-      - uses: jdx/mise-action@924e7c586e33d7d4bae9c14e26c5d22e2beb6e78 # v5.3.0
-        with:
-          cache: false
-      - run: sudo apt-get install --yes --no-install-recommends zlib1g-dev
-      - run: mise run setup
-      - run: mise run check
-      - run: mise run discover-mutants
-      - run: mise run release-compatibility
-
   release:
-    name: Complete self measurement and Linux distribution
-    needs: [candidate, self-measurement, compatibility]
+    name: Build and install the Linux distribution
+    needs: candidate
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     outputs:
@@ -190,12 +110,6 @@ jobs:
           cache: false
       - run: sudo apt-get install --yes --no-install-recommends zlib1g-dev
       - run: mise run setup
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          pattern: self-mutation-*
-          path: shard-reports
-      - run: mise run mutation -- merge shard-reports/*/mutation.json --format json --format terminal --report-dir mutation-report --min-score 100
-      - run: mise x -- prove -l xt/release
       - run: mise run dist
       - name: Record the archive to install
         id: tested
@@ -207,7 +121,6 @@ jobs:
           test ! -L "$archive"
           digest=$(sha256sum -- "$archive")
           printf 'archive=%s\nsha256=%s\nbuild_attempt=%s\n' "$archive" "${digest%% *}" "$GITHUB_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
-      - run: mise x -- make disttest
       - run: mise run verify-install
         env:
           TEST_MUTATION_DISTRIBUTION: ${{ steps.tested.outputs.archive }}
@@ -235,11 +148,10 @@ jobs:
         with:
           cache: false
       - run: mise run setup
-      - run: mise run check
-      - run: mise run discover
       - run: mise run dist
-      - run: mise x -- make disttest
       - run: mise run verify-install
+        env:
+          TEST_MUTATION_DISTRIBUTION: Test-Mutation-${{ needs.candidate.outputs.version }}.tar.gz
 
   verified:
     name: Bind the tested archive to its source and build
@@ -249,6 +161,7 @@ jobs:
     permissions:
       actions: read # Read the artifact's build run and immutable ID.
       contents: read # Read the controller and candidate commits separately.
+      statuses: read # Check that the local approval still applies to the artifact.
     outputs:
       source_sha: ${{ needs.candidate.outputs.source_sha }}
       version: ${{ needs.candidate.outputs.version }}
@@ -296,3 +209,8 @@ jobs:
           test -f "${archives[0]}"
           test ! -L "${archives[0]}"
           perl controller/xt/bin/verify-release-archive source "$SOURCE_SHA" "$VERSION" "${archives[0]}" "$SHA256" >> "$GITHUB_OUTPUT"
+      - name: Confirm local release checks still pass
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY_OWNER_ID: ${{ github.repository_owner_id }}
+        run: bash controller/xt/bin/verify-local-release-check

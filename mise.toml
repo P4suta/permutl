@@ -83,11 +83,11 @@ run = "prove -l xt/mutants"
 
 [tasks.mutation-gate]
 description = "Measure Test::Mutation with itself and check the release conditions"
-run = [
-  "perl -Ilib bin/mutation --no-cache --format terminal --format json --min-score 100",
-  "prove -l xt/release",
-  "mise run discover-mutants",
-]
+run = ['''
+  reports=${TEST_MUTATION_DETECTOR_DIR:-}
+  unset TEST_MUTATION_DETECTOR_DIR
+  perl xt/bin/confirm-self-measurement ${reports:+"$reports"/*.json}
+  ''', "prove -l xt/release", "mise run discover-mutants"]
 
 [tasks.shim-mutation]
 description = "Measure the installed shim with Perl 5.10, 5.14, and 5.18"
@@ -107,14 +107,43 @@ run = [
   "mise run verify-install",
 ]
 
+[tasks.record-release-check]
+description = "Run the local release gate and record its result on the candidate commit"
+run = "sh xt/bin/record-release-check"
+
 [tasks.release-compatibility]
 description = "Verify supported shim interpreters, coverage, engine behavior, and pinned distributions"
 run = [
+  "mise run check-ci-interpreters",
   "mise run shim-mutation",
   "mise run coverage",
   "mise run discover",
   "mise run realworld",
 ]
+
+[tasks.check-ci-interpreters]
+description = "Test the candidate commit on the driver and shim versions from the CI matrix"
+run = "perl xt/bin/check-ci-interpreters"
+
+[tasks.check-ci]
+description = "Run the local pull request checks before pushing a commit"
+run = '''
+  set -eu
+  candidate=$(git rev-parse --verify HEAD)
+  check_checkout() {
+    current=$(git rev-parse --verify HEAD)
+    changes=$(git status --porcelain=v1 --untracked-files=all)
+    if [ "$current" != "$candidate" ] || [ -n "$changes" ]; then
+      echo "The local CI checks need a clean checkout of the same commit." >&2
+      exit 1
+    fi
+  }
+  check_checkout
+  mise run check
+  check_checkout
+  mise run check-ci-interpreters
+  check_checkout
+'''
 
 [tasks.coverage]
 description = "Measure statement and branch coverage against the release floors"

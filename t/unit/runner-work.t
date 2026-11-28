@@ -1,10 +1,12 @@
 use v5.36;
 use Test2::V0;
 use File::Temp ();
+use lib 't/lib';
+use ManualClock;
 use lib 't/e2e/lib';
 use Fixture qw(copy_of);
 use lib 't/shim/lib';
-use ShimHarness qw(project write_file write_spec run_perl lib_dir);
+use ShimHarness qw(project write_file write_spec run_bare run_perl lib_dir);
 use Test::Mutation::Runner;
 use Test::Mutation::Select;
 use Test::Mutation::Settings;
@@ -57,10 +59,19 @@ PERL
 subtest 'compilation retains the selected interpreter, file and working tree' => sub {
     my $workspace = Test::Mutation::Workspace::acquire($root);
     my $run       = { root => $root, project => $root, config => $config, workspace => $workspace, perl => $^X };
+    my $outer     = 2 + ( $ENV{TEST_MUTATION_GENERATION} || 0 );
+    local $ENV{TEST_MUTATION_GENERATION} = $outer;
     Test::Mutation::Runner::_prepare_work($run);
+    my $inner    = $outer + 1;
+    my $observer = "$run->{work}/compiler/Test/Mutation/CompilerInputs/G$inner.pm";
+    is Test::Mutation::Source::read_bytes("$run->{work}/shim/Test/Mutation/Shim/G$inner.pm"),
+      Test::Mutation::Runner::shim_text($inner), 'the child test loads the shim for the next generation';
+    like Test::Mutation::Source::read_bytes($observer), qr/^package Test::Mutation::CompilerInputs::G$inner;/m,
+      'the standalone compiler loads the observer for the same generation';
     my $private = copy_of('calc');
     my $job     = { mutant => $mutants[0], copy => { root => $private }, tests => ['t/add.t'] };
     my $path    = $mutants[0]->path;
+
     for my $case (
         [ 'syntax-original', '-c',          1, q{use charnames ':full';},              1 ],
         [ 'code-original',   '-MO=Deparse', 1, q{use strict;},                         0 ],
@@ -118,7 +129,120 @@ subtest 'compilation retains the selected interpreter, file and working tree' =>
         my $task = Test::Mutation::Runner::_compile_task( $run, $job, 'syntax-mutant', $file, '-c' );
         is $task->{timeout}, $duration < 1 ? 10 : 25, 'a measured compile supplies a deadline with a floor';
     }
-    ok $workspace->release(0), 'the compiler leaves its workspace releasable';
+    my $dependency = write_file( "$private/Imported.pm", q{BEGIN { open my $input, '<', '/table' or die $! }} );
+    my $original   = Test::Mutation::Runner::_compile_task( $run, $job, 'code-original', "$root/$path", '-MO=Deparse' );
+    my $previous   = $original->{payload}{tmp};
+    write_file( "$previous/inputs", 'm' . unpack( 'H*', $dependency ) . "\n.\n" );
+    my $retry = Test::Mutation::Runner::_after_task( $run, {}, $original, {} );
+    is $retry->{env}{TEST_MUTATION_COMPILER_READS}, 'f' . unpack( 'H*', '/table' ), 'the retry binds the imported read';
+    ok !-e $previous,             'the first compiler directory has been released before the retry runs';
+    ok -d $retry->{payload}{tmp}, 'the retry has its own live directory';
+    ok $workspace->release(0),    'the compiler leaves its workspace releasable';
+};
+
+subtest 'compiler input records distinguish a rejection from an interrupted compiler' => sub {
+    my $tmp = File::Temp::tempdir( CLEANUP => 1 );
+    for my $case (
+        [ 'syntax-mutant',   { exit       => 25 },                 ".\n",  1, 0 ],
+        [ 'syntax-mutant',   { exit       => 25 },                 "ab\n", 0, 1 ],
+        [ 'syntax-mutant',   { signal     => 9 },                  ".\n",  0, 1 ],
+        [ 'syntax-mutant',   { timed_out  => 1 },                  ".\n",  0, 1 ],
+        [ 'syntax-mutant',   { overflowed => 1 },                  ".\n",  0, 1 ],
+        [ 'syntax-mutant',   { exit       => 25, timed_out => 1 }, ".\n",  0, 1 ],
+        [ 'code-mutant',     { exit       => 25 },                 ".\n",  0, 0 ],
+        [ 'syntax-original', { exit       => 25 },                 ".\n",  0, 1 ],
+        [ 'code-original',   { exit       => 25 },                 ".\n",  0, 1 ],
+      )
+    {
+        my ( $kind, $outcome, $record, $known, $missing ) = @$case;
+        write_file( "$tmp/inputs", $record );
+        my ( $run, $job, $result ) = ( {}, {}, {%$outcome} );
+        my $task = { payload => { tmp => $tmp, kind => $kind }, env => { TEST_MUTATION_COMPILER_READS => q{} } };
+        Test::Mutation::Runner::_remember_compiler_inputs( $run, $job, $task, $result );
+        my $label = join q{ }, $kind, sort keys %$outcome;
+        is $result->{compiler_inputs}, $known ? {} : undef, "$label checks the record of the performed compilation";
+        is $run->{missing_compiler_inputs} || 0, $missing,  "$label preserves the completeness of the run";
+        ok $job->{unbound_compiler}, "$label requires the mutant to be checked again";
+    }
+};
+
+subtest 'the absence of compiler reads is remembered for the next mutant of the source' => sub {
+    my $path        = 'lib/Bound.pm';
+    my $source      = Test::Mutation::Source->from_bytes( path => $path, bytes => "package Bound;\nCHECK { }\n1;\n" );
+    my $run         = { sources => { $path => $source } };
+    my $inspections = 0;
+    my $parse       = \&PPI::Document::new;
+    no warnings 'redefine';
+    local *PPI::Document::new = sub (@args) {
+        $inspections++ if ref $args[1] eq 'SCALAR';
+        return $parse->(@args);
+    };
+    ok !Test::Mutation::Runner::_may_read_at_compile_time( $run, $path ), 'an empty CHECK block reads no files';
+    ok !Test::Mutation::Runner::_may_read_at_compile_time( $run, $path ), 'a second mutant shares the result';
+    is $inspections, 1, 'the unchanged source needs one inspection';
+};
+
+subtest 'an imported module keeps its unknown inputs across inspections and removal' => sub {
+    my $area   = project();
+    my $module = write_file( "$area/modules/Threshold.pm", <<'MODULE' );
+package Threshold;
+my $path = $ENV{LIMIT_FILE};
+open my $input, '<', $path or die $!;
+my $limit = <$input>;
+close $input or die $!;
+sub limit { return $limit }
+1;
+MODULE
+    write_file( "$area/selected.pl", "use Threshold (); 1;\n" );
+    my $compiled = run_bare(
+        root => $area,
+        env  => { TEST_MUTATION_COMPILER_INPUTS => "$area/inputs", LIMIT_FILE => write_file( "$area/limit", "7\n" ) },
+        args => [ '-I' . lib_dir(), "-I$area/modules", '-MTest::Mutation::CompilerInputs', '-c', 'selected.pl' ],
+    );
+    is $compiled->{status}, 0, 'the target Perl actually loaded the data reader' or diag $compiled->{stderr};
+    my $consult = sub ($run) {
+        my $result = {};
+        Test::Mutation::Runner::_compiler_inputs( $run, $area, $result );
+        return $result->{module_reads};
+    };
+    my $run = {};
+    is $consult->($run), { q{?} => 1 }, 'the loaded code can read an indirect path';
+    is $consult->($run), { q{?} => 1 }, 'the next compilation retains the same uncertainty';
+    unlink $module or die $!;
+    is $consult->( {} ), { q{?} => 1 }, 'a recorded module that disappeared cannot establish the absence of reads';
+};
+
+subtest 'one comparison ends when the original and the uncovered mutant have compiled' => sub {
+    local $ENV{PERL5OPT} = '-Mstrict';
+    my ($mutant)  = grep { $_->comparable } @mutants;
+    my $workspace = Test::Mutation::Workspace::acquire($root);
+    my $run       = {
+        root      => $root,
+        project   => $root,
+        config    => $config,
+        workspace => $workspace,
+        perl      => $^X,
+        sources   => $selection->sources
+    };
+    Test::Mutation::Runner::_prepare_work($run);
+    my $job     = { mutant => $mutant, tests => [], verdict => Test::Mutation::Verdict::start() };
+    my @pending = Test::Mutation::Runner::_next_code( $run, $job );
+    my ( @completed, $extra );
+    Test::Mutation::Pool::run(
+        jobs => 1,
+        next => sub { return shift @pending },
+        done => sub ( $task, $result ) {
+            push @completed, $task->{payload}{kind};
+            my $next = Test::Mutation::Runner::_after_task( $run, {}, $task, $result );
+            return $next if @completed < 2;
+            $extra = $next;
+            return;
+        },
+    );
+    is \@completed, [qw(code-original code-mutant)], 'the target Perl compiled both sides of the comparison';
+    is $extra,      undef,                           'the completed comparison schedules no further compiler';
+    like $job->{code}, qr/\A[0-9a-f]{64}\z/, 'the result keeps the real mutant fingerprint';
+    ok $workspace->release(0), 'the workspace is released after the comparison';
 };
 
 subtest 'every original compiler observation records the result before the job continues' => sub {
@@ -151,7 +275,7 @@ subtest 'every original compiler observation records the result before the job c
         local *Test::Mutation::Runner::_after_code = sub { return 'handled' };    ## no critic (Variables::ProtectPrivateVars)
         is Test::Mutation::Runner::_after_task( $run, {}, $task, $result ), 'handled', 'the job can resume';
         is [ $run->{original_compile}{$path}->@{qw(passed duration code inputs opaque)} ],
-          [ $exit ? 0 : 1, 2.5, $digest, $inputs, undef ],
+          [ $exit ? 0 : 1, 2.5, $digest, $exit ? undef : $inputs, undef ],
           'syntax and equivalence share the same completed original compiler observation';
         my $shared = $run->{original_compile}{$path};
         delete $task->{payload}{original};
@@ -190,6 +314,31 @@ subtest 'only a completed nonempty mutant deparse provides a digest for comparis
         Test::Mutation::Runner::_after_code( {}, $task, $result );
         is $job->{code}, $usable ? 'fingerprint' : q{}, 'a failed or empty deparse cannot establish equivalence';
     }
+};
+
+subtest 'a durable published result completes its checkpoint without another wait' => sub {
+    my $mutant = $mutants[0];
+    my $path   = project() . '/measurement.sqlite';
+    my $cache  = { path => $path, targets => { $mutant->path => 'source' }, facts => { 't/add.t' => 'observed' } };
+    my $entry =
+      Test::Mutation::Runner::_entry( $mutant, 'Killed', undef, 'sum changed', 't/add.t', ['t/add.t'], 1, 0.1 );
+    my @published;
+    my $run = {
+        listener => sub ( $event, $record ) {
+            push @published, Test::Mutation::Store::load($path)->{ $record->{mutant}->id }{status};
+            return;
+        }
+    };
+    my $save  = Test::Mutation::Runner::_publish_finished( $run, $cache, $entry, {}, {} );
+    my $count = Test::Mutation::Pool::run(
+        jobs        => 1,
+        clock       => ManualClock->new( limit => 0 ),
+        checkpoints => [$save],
+        next        => sub { return },
+        done        => sub { die 'unexpected test completion' }
+    );
+    is $count,      0,          'the completed checkpoint needs no child process';
+    is \@published, ['Killed'], 'the observer receives the durable result once';
 };
 
 subtest 'interruptions retain completed verdicts and account for every attempted test' => sub {

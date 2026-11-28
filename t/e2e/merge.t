@@ -1,5 +1,6 @@
 use v5.36;
 use Test2::V0;
+use Cwd      ();
 use JSON::PP ();
 use lib 't/e2e/lib';
 use Fixture        qw(copy_of ran run_fixture statuses write_file);
@@ -32,6 +33,27 @@ for my $part ( 1, 2 ) {
     ran( 0, $root, 'run', '--shard', "$part/2", '--report-dir', "part$part", @options );
 }
 my @reports = ( 'part2/mutation.json', 'part1/mutation.json' );
+
+subtest 'older compiler comparisons cannot certify the input that initialized a package variable' => sub {
+
+    # Commit 395ef555 measured the two shards with different values in BOUNDARY_INPUT.
+    my @saved = map { Cwd::abs_path("t/e2e/fixtures/shards-before-input-verification/part-$_.json") } 1, 2;
+    my @prior = map { Test::Mutation::Report::Json::parse( slurp($_) ) } @saved;
+    is [ map { $_->entries->[0]{status} } @prior ], [qw(Killed Survived)], 'both original verdicts remain readable';
+    ok defined $prior[0]->measurement_digest, 'the historical input digest is still available to readers';
+    my $diagnostic = qr/measurement inputs are missing, rerun every shard before merging/;
+    my $merge      = ran( 2, $root, 'merge', @saved, '--format', 'json', '--report-dir', 'unverified' );
+    like $merge->{stderr}, $diagnostic, 'the CLI requests fresh compiler input evidence';
+    ok !-e "$root/unverified/mutation.json", 'incompatible inputs did not publish a score';
+    my @copied;
+
+    for my $part ( 0, 1 ) {
+        my $json = Test::Mutation::Report::Json::render( $prior[$part], high => 80, low => 60 );
+        push @copied, { name => $saved[$part], result => Test::Mutation::Report::Json::parse($json) };
+    }
+    like dies { Test::Mutation::Merge::merge( \@copied ) }, $diagnostic,
+      'reading and saving a report again cannot upgrade its compiler observations';
+};
 
 subtest 'the merge command reports the whole run from the reports of its parts' => sub {
     my $merge = ran( 0, $root, 'merge', @reports, '--report-dir', 'whole', '--format', 'json', '--format', 'terminal' );

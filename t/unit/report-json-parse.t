@@ -220,6 +220,21 @@ sub read_back (%fields) {
         Test::Mutation::Report::Json::render( $written, high => 80, low => 60 ) );
 }
 
+subtest 'a saved cache disagreement prevents a passing score gate' => sub {
+    my $detected =
+      entry( 'Killed', id => '000000000001', by => 't/sign.t', covered_by => ['t/sign.t'], tests_run => 1 );
+    my %measured = (
+        entries   => [$detected],
+        tests     => [ { name => 't/sign.t', duration => 1 } ],
+        min_score => 100,
+    );
+    my $success  = read_back(%measured)->assessment;
+    my $mismatch = read_back( %measured, cache_mismatch => 1 )->assessment;
+    is [ $success->@{qw(score gate exitCode)} ], [ 100, 'passed', 0 ], 'the detected mutant meets the threshold';
+    is [ $mismatch->@{qw(score gate exitCode)} ], [ 100, 'unavailable', 4 ],
+      'the same tally cannot pass when rechecking the cached verdict disagreed';
+};
+
 subtest 'locations at the edges of a source are read, and the entries keep the order of the report' => sub {
     my %text = ( 'lib/Calc.pm' => $source, 'lib/Zero.pm' => "1;\n" );
     my $at   = sub ( $id, $path, $start, $end, $from, $to ) {

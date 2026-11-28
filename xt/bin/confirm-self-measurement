@@ -1,0 +1,18 @@
+#!perl
+use v5.36;
+use FindBin qw($RealBin);
+use lib "$RealBin/../../lib", "$RealBin/../lib";
+use SelfMeasurement;
+use Test::Mutation::CLI      ();
+use Test::Mutation::Select   ();
+use Test::Mutation::Settings ();
+
+my $detectors = {};
+if (@ARGV) {
+    my $config    = Test::Mutation::Settings::of_call( { root => q{.}, cache => 0 } );
+    my $selection = Test::Mutation::Select::resolve( config => $config, read_only => 1 );
+    $detectors = SelfMeasurement::detector_hints( $selection, @ARGV );
+}
+
+exit Test::Mutation::CLI::main_with_detector_hints( $detectors,
+    '--no-cache', '--format', 'terminal', '--format', 'json', '--min-score', '100' );

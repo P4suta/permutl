@@ -23,6 +23,9 @@ use Test::Mutation::Store::Analysis;
 
 our $VERSION = '0.001';
 
+# Revise this key when the analyzer changes the sites, candidates or refusals it records.
+our $ANALYSIS_REVISION = 3;
+
 sub _refuse ( $path, $reason ) {
     return Test::Mutation::Error::raise( 'path-selector-invalid', path => $path, reason => $reason );
 }
@@ -96,6 +99,32 @@ sub operand_paths ( $config, $operands ) {
     return paths( $config->root, $operands, _files( $config, $config->root, 'source', {} ) );
 }
 
+sub _rules_digest ( $config, $version, $mutators ) {
+    return Test::Mutation::Store::Key::digest(
+        $VERSION, $ANALYSIS_REVISION, "$version", _parser_versions(),
+        $config->suppress_require_names,
+        $config->suppress_require_reason,
+        map { $_->name } @$mutators
+    );
+}
+
+sub _catalog_digest ( $rules, $digests ) {
+    return Test::Mutation::Store::Key::digest( $rules, map { ( $_, $digests->{$_} ) } sort keys %$digests );
+}
+
+signature_for measurement_rules => (
+    positional => [ InstanceOf ['Test::Mutation::Config'], InstanceOf ['Test::Mutation::Selection'] ],
+    returns    => Str
+);
+
+sub measurement_rules ( $config, $selection ) {
+    return $selection->analysis_rules_digest if $selection->has_analysis_rules_digest;
+    my ( undef, $version ) = _interpreter( $selection->project, $selection->perl );
+    my $rules = _rules_digest( $config, $version, $selection->mutators );
+    return $rules if _catalog_digest( $rules, $selection->digests ) eq $selection->catalog_digest;
+    return Test::Mutation::Store::Key::digest( $rules, $selection->catalog_digest );
+}
+
 sub resolve ($arg) {
     my $config = $arg->config;
     my $root   = $config->root;
@@ -111,6 +140,7 @@ sub resolve ($arg) {
         disable => $config->disable
     );
     my ( $program, $version ) = _interpreter( $root, $config->perl );
+    my $rules = _rules_digest( $config, $version, $mutators );
     my %matches;
     my $files   = _files( $config, $root, 'source', \%matches );
     my $tests   = _files( $config, $root, 'test',   \%matches );
@@ -127,6 +157,7 @@ sub resolve ($arg) {
             pending       => \@pending,
             read_only     => $arg->read_only,
             prefixes      => $prefixes,
+            rules         => $rules,
             version       => $version,
             paths         => $arg->identifiers && !@$prefixes ? {} : $paths,
             changed       => $changed,
@@ -147,12 +178,7 @@ sub resolve ($arg) {
     $filters{paths}   = $paths                  if defined $paths;
     $filters{since}   = $config->since          if defined $config->since;
     $filters{mutants} = [ $config->mutant->@* ] if $config->mutant->@*;
-    my $digests = $analysis->{digests};
-    my $catalog = Test::Mutation::Store::Key::digest(
-        $VERSION, "$version",
-        Test::Mutation::Store::Key::digest( map { $_->name } @$mutators ),
-        map { ( $_, $digests->{$_} ) } sort keys %$digests
-    );
+    my $catalog = _catalog_digest( $rules, $analysis->{digests} );
     outputs( $config, $arg->summary )                                                           if $arg->reports;
     Test::Mutation::Store::Analysis::publish( Test::Mutation::Store::path($config), \@pending ) if @pending;
     return Test::Mutation::Selection->new(
@@ -171,6 +197,7 @@ sub resolve ($arg) {
               || grep { exists $config->specified->{$_} }
               qw(source source-exclude test test-exclude since mutant enable disable profile shard)
         ) ? 1 : 0,
+        analysis_rules_digest => $rules,
     );
 }
 
@@ -338,18 +365,13 @@ sub _parser_versions () {
 }
 
 sub _file_reader ( $config, $mutators, $options ) {
-    my %chosen     = map { $_->name => 1 } $mutators->@*;
-    my $others     = [ grep { !$chosen{ $_->name } } Test::Mutation::Mutator::Catalog::mutators()->@* ];
-    my $store      = Test::Mutation::Store::path( $config, 0 );
-    my $db         = $config->cache ? Test::Mutation::Store::read_database($store) : undef;
-    my $conditions = Test::Mutation::Store::Key::digest(
-        $VERSION, "$options->{version}", _parser_versions(),
-        $config->suppress_require_names,
-        $config->suppress_require_reason,
-        map { $_->name } @$mutators
-    );
+    my %chosen = map { $_->name => 1 } $mutators->@*;
+    my $others = [ grep { !$chosen{ $_->name } } Test::Mutation::Mutator::Catalog::mutators()->@* ];
+    my $store  = Test::Mutation::Store::path( $config, 0 );
+    my $db     = $config->cache ? Test::Mutation::Store::read_database($store) : undef;
     return sub ( $batch, $visit ) {
-        my @identities = map { Test::Mutation::Store::Key::digest( $conditions, $_->@{qw(path digest)} ) } @$batch;
+        my @identities =
+          map { Test::Mutation::Store::Key::digest( $options->{rules}, $_->@{qw(path digest)} ) } @$batch;
         my $saved = $db ? Test::Mutation::Store::Analysis::read_files( $db, \@identities, $options->{prefixes} ) : {};
         for my $index ( keys @$batch ) {
             my ( $path, $source ) = $batch->[$index]->@{qw(path source)};
@@ -494,6 +516,12 @@ Returns a L<Test::Mutation::Selection> before the runner acquires a workspace.
 =head2 operand_paths
 
 Resolves path and line operands against the configured source files.
+
+=head2 measurement_rules
+
+Returns the analysis rules for a resolved or caller-supplied selection.
+For a selection that supplies only a catalog digest, it uses the target Perl, mutators and settings to reconstruct the catalog.
+A catalog with different inputs keeps a separate measurement identity.
 
 =head2 by_id
 

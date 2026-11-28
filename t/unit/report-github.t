@@ -51,6 +51,8 @@ sub result ($entries) {
 }
 
 subtest 'annotations name the place of each undetected mutant' => sub {
+    isa_ok dies { Test::Mutation::Report::GitHub::annotations( {} ) }, ['Error::TypeTiny'],
+      'annotation input must be a measurement result';
     my $text = Test::Mutation::Report::GitHub::annotations(
         result(
             [
@@ -107,9 +109,10 @@ subtest 'the summary names a sample of the gaps and the full report' => sub {
     is scalar( () = $commands =~ /^::warning /mg ), 10, 'ten warnings';
     is scalar( () = $commands =~ /^::notice /mg ),  10, 'ten notices';
     my $summary = Test::Mutation::Report::GitHub::summary( $result, 85, ['artifacts/mutation.json'] );
-    like $summary,   qr/Gate: .*85%/,               'the summary includes the threshold decision';
-    like $summary,   qr/^Undetected: 12$/m,         'the full count excludes timeouts';
-    like $summary,   qr/000000000001/,              'the first undetected change is included';
+    like $summary, qr/Gate: .*85%/,       'the summary includes the threshold decision';
+    like $summary, qr/^Undetected: 12$/m, 'the full count excludes timeouts';
+    my @sample = $summary =~ /^\| ([0-9a-f]{12}) \|/mg;
+    is \@sample, [ map { sprintf '%012x', $_ } 1 .. 5 ], 'the table lists the first five undetected changes in order';
     unlike $summary, qr/00000000000c/,              'the sample leaves room for the report location';
     like $summary,   qr{artifacts/mutation[.]json}, 'the summary names the published file';
     unlike $summary, qr/\| lib\/A\|B[.]pm \|/,      'a pipe in a filename cannot split a table cell';
@@ -124,6 +127,24 @@ subtest 'the step limit counts encoded bytes' => sub {
     like $summary, qr{reports/mutation[.]html}, 'the file location survives an oversized example';
 };
 
+subtest 'the sample skips oversized changes and fits as many later rows as the step allows' => sub {
+    my $result = result(
+        [
+            entry('Killed'),
+            entry( 'Survived', mutant => { id => '000000000001', description => 'x' x 2000 } ),
+            map { entry( 'Survived', mutant => { id => sprintf( '%012x', $_ ), description => "\x{754c}" x 200 } ) }
+              2 .. 5
+        ]
+    );
+    my $bytes = 1600;
+    my $text  = Test::Mutation::Report::GitHub::summary( $result, 70, [], 1024 * 1024 - $bytes );
+    my @rows  = $text =~ /^\| ([0-9a-f]{12}) \|/mg;
+    is \@rows, ['000000000002'], 'the first row that fits follows a detected change and an oversized example';
+    is scalar( () = $text =~ /^### Undetected changes$/mg ), 1, 'the table has a single heading';
+    like $text, qr/^\| ID \| Location \| Change \| Status \|$/m, 'the sample identifies its four columns';
+    cmp_ok length( Encode::encode( 'UTF-8', $text ) ), '<=', $bytes, 'every included row uses its encoded byte length';
+};
+
 subtest 'large selections reserve room for the gate and report location' => sub {
     my $case = Test::Mutation::Result->new( result( [ entry('Survived') ] )->%*,
         selection => { paths => { ( 'a' x 1200 ) => [] } } );
@@ -131,6 +152,10 @@ subtest 'large selections reserve room for the gate and report location' => sub 
     cmp_ok length( Encode::encode( 'UTF-8', $text ) ), '<=', 512, 'existing step text uses the same byte budget';
     like $text, qr/Gate: failed/,            'a large selection still shows the gate';
     like $text, qr{reports/mutation[.]json}, 'the destination remains available when paths must be abbreviated';
+    my $compact = Test::Mutation::Report::GitHub::summary( $case, 70, ['reports/mutation.json'], 1024 * 1024 - 160 );
+    cmp_ok length( Encode::encode( 'UTF-8', $compact ) ), '<=', 160, 'the compact report fits the remaining bytes';
+    like $compact, qr/Gate: failed/,            'the threshold decision remains in the compact report';
+    like $compact, qr{reports/mutation[.]json}, 'the report path takes precedence over the follow-up command';
 };
 
 subtest 'a full step summary needs no measurement traversal' => sub {

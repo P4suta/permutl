@@ -75,9 +75,10 @@ sub sample ( $ids, $seed ) {
     return [ @ordered[ 0 .. $take - 1 ] ];
 }
 
-signature_for load => ( positional => [ Str, Optional [ Maybe [ ArrayRef [Str] ] ] ], returns => HashRef [$RECORD] );
+signature_for load =>
+  ( positional => [ Str, Maybe [ ArrayRef [Str] ], { default => undef } ], returns => HashRef [$RECORD] );
 
-sub load ( $path, $ids = undef ) {
+sub load ( $path, $ids ) {
     my $records;
     if ( $path =~ /[.]sqlite\z/ ) {
         my $db = read_database($path);
@@ -147,17 +148,23 @@ sub path ( $config, $write ) {
 signature_for transaction => ( positional => [ InstanceOf ['DBI::db'], CodeRef ], returns => Defined );
 
 sub transaction ( $db, $operation ) {
+    local $db->{RaiseError} = 1;
     $db->begin_work;
     my $committed = Test::Mutation::Try::attempt(
         sub {
             my $value = $operation->();
-            $db->commit;
-            return $value;
+            my $saved = $db->commit;
+            return $value // $saved;
         },
         'interruption'
     );
     return $committed->{value} if exists $committed->{value};
-    $db->rollback unless $db->{AutoCommit};
+    if    ( !$db->{AutoCommit} ) { $db->rollback }
+    elsif ( $db->{Driver}{Name} eq 'SQLite' && !$db->sqlite_get_autocommit ) {
+
+        # DBI may restore AutoCommit while SQLite still holds a transaction that failed to commit.
+        $db->do('ROLLBACK');
+    }
     die $committed->{error};    ## no critic (ErrorHandling::RequireCarping)
 }
 
@@ -209,9 +216,10 @@ sub read_database ($path) {
     return _initialized( $db, $path, 1 ) ? $db : undef;
 }
 
-signature_for database => ( positional => [ Str, Optional [ Maybe [Str] ] ], returns => InstanceOf ['DBI::db'] );
+signature_for database =>
+  ( positional => [ Str, Maybe [Str], { default => undef } ], returns => InstanceOf ['DBI::db'] );
 
-sub database ( $path, $legacy = undef ) {
+sub database ( $path, $legacy ) {
     my $directory = File::Basename::dirname($path);
     Test::Mutation::Tree::make($directory) unless -d $directory;
     my $db = _connect($path);
@@ -219,7 +227,7 @@ sub database ( $path, $legacy = undef ) {
     transaction(
         $db,
         sub {
-            return 1 if ( $db->selectrow_array('PRAGMA user_version') )[0];
+            return if _initialized( $db, $path );
             $db->do('CREATE TABLE verdict (id TEXT PRIMARY KEY, path TEXT, source TEXT, data TEXT NOT NULL)');
             $db->do('CREATE INDEX verdict_path ON verdict(path)');
             $db->do('CREATE TABLE original (id TEXT PRIMARY KEY, data TEXT NOT NULL)');
@@ -240,7 +248,7 @@ sub database ( $path, $legacy = undef ) {
             my $old = _read( $legacy // "$directory/cache.json" );
             _update( $db, _identified($old), undef, {}, _originals($old) );
             $db->do('PRAGMA user_version = 1');
-            return 1;
+            return;
         }
     );
     return $db;
@@ -280,7 +288,8 @@ sub _verdict_writer ($db) {
     my $remove = $db->prepare('DELETE FROM verdict WHERE id = ?');
     return sub ( $id, $record ) {
         if ( Test::Mutation::Status::of( $record->{status} )->cached ) {
-            $put->execute( $id, $record->@{qw(path source)}, $JSON->encode($record) );
+            my ( $path, $source ) = $record->@{qw(path source)};
+            $put->execute( $id, $path, $source, $JSON->encode($record) );
         }
         else { $remove->execute($id) }
         return;
@@ -312,7 +321,9 @@ sub checkpoints ($path) {
         $db->sqlite_busy_timeout( $timeout = $wait ) if $timeout != $wait;
         my $attempt = Test::Mutation::Try::attempt( sub { $write->( $id, $record ); return 1 } );
         if ( exists $attempt->{error} ) {
-            if ( !$blocking && ( ( $db->err // 0 ) & 255 ) == SQLITE_BUSY ) {
+            my $code = $db->err;
+            $db->set_err( undef, undef );
+            if ( !$blocking && defined $code && ( $code & 255 ) == SQLITE_BUSY ) {
                 my $now = $clock->now;
                 $deadline //= $now + $budget / 1000;
                 return 0 if $now < $deadline;
@@ -320,7 +331,7 @@ sub checkpoints ($path) {
             die $attempt->{error};    ## no critic (ErrorHandling::RequireCarping)
         }
         $deadline = undef;
-        return defined $may_wait ? 1 : undef;
+        return defined $may_wait ? $attempt->{value} : undef;
     };
 }
 
@@ -451,6 +462,7 @@ A write uses a temporary snapshot that lasts for the life of the configuration.
 =head2 transaction
 
 Runs a database update and commits its return value with the completed work.
+If the update returns no value, the transaction returns the database's commit acknowledgement.
 
 =head2 checkpoints
 

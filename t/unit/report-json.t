@@ -223,8 +223,7 @@ subtest 'tests are listed as test files' => sub {
 };
 
 subtest 'the document carries the facts of the run that the schema has no place for' => sub {
-    is $document->{testMutation},
-      {
+    is $document->{testMutation}, {
         shard            => undef,
         inventory        => undef,
         selection        => {},
@@ -248,6 +247,8 @@ subtest 'the document carries the facts of the run that the schema has no place 
             baselineTests => 2,
             verifications => 0
         },
+
+        compilerInputProtocol => 3,
       },
       'the run facts';
 };

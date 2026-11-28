@@ -25,11 +25,12 @@ sub line_starts ($text) {
 my @files = Library::modules('t/corpus')->@*;
 is \@files,
   [
+    't/corpus/findings/AuthorSection.pm',
     't/corpus/findings/CompileDuringLoad.pm',
     't/corpus/findings/ParentProcess.pm',
     map { "t/corpus/modern/$_.pm" } qw(Class Heredoc PodData Postfix Regex Signatures TryCatch Unicode)
   ],
-  'the source corpus includes both regression fixtures and every supported syntax fixture';
+  'the source corpus includes every regression fixture and every supported syntax fixture';
 
 for my $path (@files) {
     my $text     = slurp_text($path);

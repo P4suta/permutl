@@ -5,6 +5,10 @@ Revision history for Test-Mutation
     - Build XS distributions in the measurement copy and trace tests through child interpreters.
     - Record the test that detected a mutant after confirming that it passes with the original source.
     - Reuse verified results and unmodified test runs when their inputs match.
-    - Inspect survivors by identifier and apply the same score threshold to runs, merged shards, and Perl assertions.
+    - Reject shard merges when compiler inputs or the driver's parser versions differ.
+    - Open a mutant's diff by identifier from the SQLite index and inspect its last measured verdict.
+    - Apply the same score threshold to runs, merged shards, and Perl assertions.
+    - After adding a test, use `mutation run --undetected` to recheck surviving and uncovered mutants.
+    - Pass `--enable early-exit` to include guarded exits in the default profile.
     - Publish results in the terminal, schema-compatible JSON, a single HTML file, and GitHub Actions summaries.
     - Read the command, configuration, diagnostic, and mutator reference with perldoc mutation.

@@ -18,10 +18,10 @@ my $DECISION = Dict [
 signature_for of => ( positional => [ InstanceOf ['Test::Mutation::Result'], Maybe [Num] ], returns => $DECISION );
 
 sub of ( $result, $floor ) {
-    return _outcome( $result, $floor );
+    return _early_outcome($result) || _measured( $result, $floor, $result->tally );
 }
 
-sub _outcome ( $result, $floor, $tally = undef ) {
+sub _early_outcome ($result) {
     my $signal = $result->interrupted;
     return _decision( 'interrupted', $signal, Test::Mutation::Message::text_of( 'interrupted', signal => $signal ) )
       if defined $signal;
@@ -35,20 +35,19 @@ sub _outcome ( $result, $floor, $tally = undef ) {
             Test::Mutation::Message::text_of( 'invalid-mutant', id => $mutant->id, path => $mutant->path ) );
     }
 
-    $tally //= $result->tally;
+    return _inconclusive() if $result->cache_mismatch || $result->problems->@*;
+    return;
+}
+
+sub _measured ( $result, $floor, $tally ) {
     my $score      = $tally->{score};
     my $counts     = $tally->{counts};
     my $incomplete = grep { $_->incomplete && $counts->{ $_->name } } Test::Mutation::Status::rows()->@*;
-    return _decision( 'inconclusive', 'inconclusive', Test::Mutation::Message::text_of('inconclusive') )
-      if $result->cache_mismatch
-      || $result->problems->@*
-      || $incomplete
-      || !defined $score && $counts->{Timeout};
+    return _inconclusive() if $incomplete || !defined $score && $counts->{Timeout};
     my $gated = defined $floor && !defined $result->shard;
     if ( !defined $score ) {
-        my $scope = $result->measured_scope // $result->selection;
         return _decision( 'nothing', 'inconclusive', Test::Mutation::Message::text_of('inconclusive') )
-          if $gated && !keys %$scope;
+          if $gated && !keys $result->score_scope->%*;
         return _decision( 'nothing', 'success' );
     }
     return _decision( 'measured', 'below-gate',
@@ -57,12 +56,16 @@ sub _outcome ( $result, $floor, $tally = undef ) {
     return _decision( 'measured', 'success' );
 }
 
+sub _inconclusive () {
+    return _decision( 'inconclusive', 'inconclusive', Test::Mutation::Message::text_of('inconclusive') );
+}
+
 signature_for assessment =>
   ( positional => [ InstanceOf ['Test::Mutation::Result'], Maybe [Num] ], returns => Assessment );
 
 sub assessment ( $result, $floor ) {
     my $tally   = $result->tally;
-    my $outcome = _outcome( $result, $floor, $tally );
+    my $outcome = _early_outcome($result) || _measured( $result, $floor, $tally );
     my $exit    = $outcome->{exit}->name;
     my $gate =
        !defined $floor                ? undef

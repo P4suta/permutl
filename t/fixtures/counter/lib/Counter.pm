@@ -1,6 +1,6 @@
 use v5.38;
 use experimental 'class';
-
+use feature 'say';
 class Counter 1.0 {
     field $count :param = 0;
     field $limit = 10 + 5;

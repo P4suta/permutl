@@ -14,6 +14,15 @@ our $VERSION = '0.001';
 
 with 'Test::Mutation::Value';
 
+signature_for supported_compiler_input_protocol => ( positional => [], returns => PositiveInt );
+
+sub supported_compiler_input_protocol () {
+    return 3;
+}
+
+has compiler_input_protocol =>
+  ( is => 'ro', isa => Maybe [PositiveInt], default => sub { return supported_compiler_input_protocol() } );
+
 has root => ( is => 'ro', isa => Str, required => 1 );
 has sources => ( is => 'ro', isa => HashRef [Str], required => 1 );
 has tests =>
@@ -69,6 +78,21 @@ signature_for tally => (
 
 sub tally ($self) {
     return Test::Mutation::Score::tally( [ map { $_->{status} } $self->entries->@* ] );
+}
+
+signature_for score_scope => ( method => 1, positional => [], returns => ReportSelection );
+
+sub score_scope ($self) {
+    my $measured = $self->measured_scope;
+    return defined $measured ? $measured : $self->selection;
+}
+
+signature_for verified_measurement_digest => ( method => 1, positional => [], returns => Maybe [Str] );
+
+sub verified_measurement_digest ($self) {
+    return ( $self->compiler_input_protocol || 0 ) == supported_compiler_input_protocol()
+      ? $self->measurement_digest
+      : undef;
 }
 
 signature_for assessment => ( method => 1, positional => [], returns => Assessment );
@@ -165,6 +189,10 @@ The selection records the paths, changed lines or mutant identifiers requested b
 The optional measured scope describes the verdicts included in a refreshed score when it keeps earlier entries.
 The catalog digest identifies the inputs that determine the available mutants.
 
+=head2 score_scope
+
+Returns the selection whose verdicts contribute to the score, including earlier entries retained by a refresh.
+
 =head2 min_score
 
 The minimum requested score, or undefined when the caller did not request a threshold.
@@ -179,6 +207,16 @@ The measurement digest identifies the project inputs, selected tests, interprete
 The dependency digest identifies the external libraries observed by the original tests.
 The compiler inputs map external path digests to content digests for libraries used only in standalone compilation.
 Earlier reports lack the evidence needed to merge their shards.
+
+=head2 compiler_input_protocol, verified_measurement_digest
+
+The protocol identifies how the measurement checked compiler inputs.
+The verified digest is available when the report uses the supported protocol and identifies its measurement inputs.
+The original digest remains available to inspect earlier reports.
+
+=head2 supported_compiler_input_protocol
+
+Returns the protocol used to verify a report and to identify reusable observations in the measurement cache.
 
 =head2 started, finished
 

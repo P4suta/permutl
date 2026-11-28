@@ -67,11 +67,50 @@ subtest 'several processes of one test run' => sub {
     is Test::Mutation::Record::parse( [ $untraced, $traced ] )->{served}{'/p/A.pm'}{traced}, 0, 'whatever the order';
 };
 
+subtest 'a module listed at exit uses the compilation observed by the same process' => sub {
+    my $target = '/p/A.pm';
+    my $other  = '/p/B.pm';
+    my $traced = lines( [ 'begin', 1 ], [ 'seen', $target ], [ 'hit', $target, 4 ] );
+    my $listed = lines( [ 'blind', $target, 'loaded-at-exit' ] );
+    my $observed =
+      Test::Mutation::Record::parse( [ $traced . $listed . lines( [ 'blind', $other, 'loaded-at-exit' ] ) ] );
+    is $observed->{errors}, [], 'finding a module on disk at exit is a valid observation';
+    is $observed->{served},
+      { $target => { traced => 1, hits => { 4 => 1 } }, $other => { traced => 0, hits => {} } },
+      'a successful trace explains only the file that supplied it';
+    is $observed->{compiled}, { $target => 1, $other => 1 }, 'the module registry confirms both loads';
+    my $restart = lines( [ 'begin', 1 ] );
+    is Test::Mutation::Record::parse( [ $traced, $restart . $listed ] )->{served}{$target}{traced}, 0,
+      'a different process can have loaded the same module without tracing';
+    is Test::Mutation::Record::parse( [ $traced . $restart . $listed ] )->{served}{$target}{traced}, 0,
+      'an unfinished interpreter cannot borrow a trace from before exec';
+    my $after_exec = lines( [ 'begin', 1 ], [ 'seen', $other ], [ 'hit', $other, 9 ] );
+    my $shutdown   = lines( [ 'blind', $other, 'loaded-at-exit' ], [ 'end', 23 ], [ 'end', 23 ] );
+    is Test::Mutation::Record::parse( [ $traced . $after_exec . $restart . $listed . $shutdown ] )->{served},
+      { $target => { traced => 0, hits => { 4 => 1 } }, $other => { traced => 1, hits => { 9 => 1 } } },
+      'only the two observers that reach shutdown can share their compilation after exec';
+    is Test::Mutation::Record::parse( [ $listed . $traced ] )->{served}{$target}{traced}, 0,
+      'a later compilation cannot explain an earlier observation';
+    my $opened = lines( [ 'begin', 1 ], [ 'seen', $target, 'opened' ] );
+    is Test::Mutation::Record::parse( [ $opened . $listed ] )->{served}{$target}{traced}, 0,
+      'opening a source alone never proves its compilation was traced';
+    my $blind = lines( [ 'blind', $target ] );
+
+    for my $history ( $traced . $blind, $traced . $blind . $listed, $traced . $listed . $blind ) {
+        is Test::Mutation::Record::parse( [$history] )->{served}{$target},
+          { traced => 0, hits => { 4 => 1 } },
+          'an explicit blind load keeps file coverage alongside actual hits and a load listed at exit';
+    }
+};
+
 subtest 'unknown and malformed records leave a diagnostic' => sub {
     my $record = Test::Mutation::Record::parse( ["begin\t1\nmystery\t/p/A.pm\nseen\n\nhit\t/p/A.pm\n"] );
     is $record->{errors},
       [ 'unknown record kind mystery', 'missing field for record kind seen', '/p/A.pm: invalid hit line' ],
       'unknown kinds, missing paths, and missing line numbers each retain their diagnostic';
+    my $zero = Test::Mutation::Record::parse( ["begin\t1\nseen\t/p/A.pm\t0\n"] );
+    is [ $zero->{errors}, $zero->{compiled} ], [ ['/p/A.pm: unknown load stage 0'], {} ],
+      'a zero field is an unknown stage and cannot confirm a compilation';
     is $record->{served},                             {}, 'malformed records do not establish coverage';
     is Test::Mutation::Record::parse( [] )->{served}, {}, 'no record files';
 

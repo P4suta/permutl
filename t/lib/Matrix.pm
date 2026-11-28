@@ -238,7 +238,7 @@ my $BOUND = 0.02;
 # The mutators of the default profile whose rate of mutants that no row separates passes the bound.
 sub over_bound ($tally) {
     return Oracle::rated( $tally, 'unseparated', 'varied', $BOUND,
-        'has no input of the matrix that tells it from the original in more than 2 percent of its mutants' );
+        'has no input of the matrix that tells it from the original' );
 }
 
 # The context of an expression in the matrix: the whole expression is the value of a subroutine.

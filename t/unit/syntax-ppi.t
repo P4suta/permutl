@@ -22,7 +22,7 @@ sub summary ( $code, $kind ) {
 
 subtest 'BEGIN membership uses the character offsets of the original source' => sub {
     my $first  = 'BEGIN { 1 }';
-    my $later  = "BEGIN {\r\n3;\r\n}";
+    my $later  = "sub BEGIN {\r\n3;\r\n}";
     my $text   = "\x{feff}$first\r\nEND { 2 }\r\n$later\r\n1;\r\n";
     my $source = Test::Mutation::Source->new( path => 'X.pm', text => $text, encoding => 'UTF-8' );
     my @inside = grep { Test::Mutation::Syntax::PPI::inside_begin( $source, $_ ) } 0 .. length $text;
@@ -129,6 +129,24 @@ subtest 'operators carry a role' => sub {
       'an ordering comparison of the version of Perl names its literal';
     is [ map { $_->text } sites_of( 'f( [ < $in ] );', 'operator' )->@* ], ['<'],
       'a comparison without a neighbor on one side is read without a literal';
+    my $unfinished = 'my $active = $start ...; my $complete = $start ... $end;';
+    is [ map { $_->facts->{flip_flop} } grep { $_->text eq '...' } sites_of( $unfinished, 'operator' )->@* ],
+      [ undef, 1 ], 'a scalar assignment supplies a flip-flop only when both operands are present';
+};
+
+subtest 'condition keywords used as method names take list arguments' => sub {
+    my $code = <<'PERL';
+sub route {
+    my ($rule, $first, $last) = @_;
+    $rule->if($first ... $last);
+    return 1 if (($first ... $last));
+    my @values = $rule->if + $first ... $last;
+    my $active = $rule->if + $first ... $last;
+    my @other = $rule->if() + $first ... $last;
+}
+PERL
+    is [ map { $_->facts->{flip_flop} } grep { $_->text eq '...' } sites_of( $code, 'operator' )->@* ],
+      [ undef, 1, undef, 1, undef ], 'the assignment sets the context of a range starting with a method result';
 };
 
 subtest 'a readline that the parser takes for two comparisons yields no site' => sub {
@@ -845,6 +863,19 @@ subtest 'an anonymous subroutine inside a use statement yields its sites' => sub
     is summary( "use v5.36;\nuse constant PICK => sub (\$n = 2 * 3) { \$n - 1 };\n", 'operator' ),
       [ [ q{=}, 'binary' ], [ q{*}, 'binary' ], [ q{-}, 'binary' ] ],
       'the default argument and the body of a constant subroutine';
+};
+
+subtest 'an overload callback returned by a block retains its executable sites' => sub {
+    my $code = <<'PERL';
+package Weighted;
+use overload q{+} => do {
+    sub sub { return $_[0] + 1 }
+    my $weight = Weighted::sub(1);
+    sub { $_[1] * $weight }
+};
+PERL
+    is [ map { [ $_->text, $_->scope ] } sites_of( $code, 'operator' )->@* ], [ [ q{*}, [ 5, 5 ] ] ],
+      'the runtime callback supplies the operator and the named import helper stays outside its scope';
 };
 
 subtest 'the name and version of a constant declaration stay outside the value' => sub {

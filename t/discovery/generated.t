@@ -10,7 +10,7 @@ use Test::Mutation::Host;
 
 # Generated snippets put every operator of PPI between operands of every shape, in every context that runs code.
 # The list has no random part, and perl decides which snippets are code at all.
-# Each snippet goes through the oracles, and its expression must have the same mutants in every context.
+# Each snippet goes through the oracles, and its expression must have the mutants that its context permits.
 
 subtest 'the pairs reject a tuple list that leaves a pair out' => sub {
     my @sizes  = ( 5, 3, 4, 2 );
@@ -99,6 +99,23 @@ subtest 'the context check rejects a context that changes the mutants of an expr
       'a context that the analysis never reads loses every change';
 };
 
+subtest 'the context check expects an endpoint change only in a known scalar context' => sub {
+    my %context = map { $_->{name} => $_ } Snippets::contexts();
+    my %operand = map { $_->{name} => $_ } Snippets::operands();
+    my $range   = Snippets::expression( '...', @operand{qw(variable literal)} );
+    for my $name ( qw(assignment modifier argument return), 'compound condition' ) {
+        is Snippets::lost( $context{$name}, $range ), [], "the $name context produces the specified changes";
+    }
+    my $endpoint = '3 ... -> .. range-boundary';
+    my $literal  = '7 2 -> 3 number-literal';
+    is Snippets::lost( $context{modifier}, $range, [$literal] ), ["- $endpoint"],
+      'losing the flip-flop in a scalar condition fails';
+    is Snippets::lost( $context{argument}, $range, [ $literal, $endpoint ] ), ["+ $endpoint"],
+      'changing a range between equivalent list operators fails';
+    is Snippets::lost( $context{assignment}, $range, [$endpoint] ), ["- $literal"],
+      'the scalar exception cannot hide another mutator losing the end operand';
+};
+
 subtest 'the matrix rejects a context that cuts the expression' => sub {
     my ($return) = grep { $_->{name} eq 'return' } Snippets::contexts();
     is Matrix::context()->{code}, 'sub c { return ( EXPR ) }', 'the expression stands inside parentheses';
@@ -169,9 +186,7 @@ subtest 'the matrix rejects a mutant that no input tells from the original' => s
     Oracle::count( $tally, 'number-literal',      'varied',      50 );
     Oracle::count( $tally, 'number-literal',      'unseparated', 25 );
     is Matrix::over_bound($tally),
-      [
-        'comparison-negation has no input of the matrix that tells it from the original in more than 2 percent of its mutants'
-      ],
+      ['comparison-negation has no input of the matrix that tells it from the original (2 of 50, limit 2%)'],
       'a mutator of the default profile above 2 percent is a finding, and one of the extended profile has no bound';
     is Gate::outcomes( sub { Gate::findings( 'mutants-c2-rejected', Matrix::over_bound($tally) ) } ),
       ['fail'], 'and a finding fails the gate';

@@ -69,6 +69,7 @@ jobs:
     permissions:
       contents: write  # Attach verified assets and publish the draft.
       actions: read  # Read the verified distribution artifact.
+      statuses: read  # Let the release gate verify local checks.
     # GitHub resolves local reusable workflows at the caller's commit.
     uses: ./.github/workflows/publish-cpan.yml  # zizmor: ignore[self-repository]
     with:

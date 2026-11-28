@@ -5,6 +5,7 @@ use Encode   ();
 use JSON::PP ();
 use Fcntl    qw(:flock O_RDONLY);
 use Fixture  qw(write_file);
+use Capability;
 use Gate;
 use Invariants;
 use Samples;
@@ -195,7 +196,8 @@ subtest 'GitHub uses the remaining space in a shared step summary' => sub {
     no warnings 'redefine';
     local *Test::Mutation::Runner::run = sub { return $sample };
     my $first = World::observe( \@args, cwd => $root, env => { GITHUB_STEP_SUMMARY => $file } );
-    is $first->{exit}, 0, 'the summary is written';
+    is $first->{exit},     0,  'the summary is written';
+    is $first->{warnings}, [], 'starting an empty step summary emits no Perl warning';
     like Test::Mutation::Source::read_bytes($file), qr{saved/mutation[.]json}, 'the summary points to the actual file';
     my $limit = 1024 * 1024;
     write_file( $file, 'x' x ( $limit - 80 ) );
@@ -203,6 +205,39 @@ subtest 'GitHub uses the remaining space in a shared step summary' => sub {
     is $repeat->{exit}, 0, 'a nearly full summary keeps its measurement outcome';
     ok -s $file <= $limit, 'the append respects the bytes already present';
     like Test::Mutation::Source::read_bytes($file), qr/Undetected: 1/, 'the compact summary still reports the gap';
+
+    my $brief = "Undetected: 1\nScore: **0.0%** (0 of 1 valid mutant)\n";
+    my $last  = Encode::encode( 'UTF-8', "\x{65e5}" );
+    for my $case (
+        [
+            $last,      length($brief) + 1,
+            "\n$brief", 'a final Japanese character and the brief report occupy separate lines'
+        ],
+        [ $last, length($brief), q{},    'the report needs space for the missing line ending' ],
+        [ "\n",  length($brief), $brief, 'a terminated line leaves every remaining byte for the report' ],
+        [ "\r",  length($brief), $brief, 'a carriage return already ends a Markdown line' ],
+      )
+    {
+        my ( $ending, $remaining, $expected, $label ) = @$case;
+        my $before = 'x' x ( $limit - $remaining - length $ending ) . $ending;
+        write_file( $file, $before );
+        my $append = World::observe( \@args, cwd => $root, env => { GITHUB_STEP_SUMMARY => $file } );
+        is $append->{exit}, 0, 'a bounded append preserves the measurement outcome';
+        my $bytes = Test::Mutation::Source::read_bytes($file);
+        is substr( $bytes, length($before) - length($ending) ), $ending . $expected, $label;
+    }
+
+    subtest 'an append-only writer can use a step summary it cannot read' => sub {
+        Capability::need( 'unprivileged', $> != 0, 'the superuser can read write-only files' );
+        write_file( $file, 'earlier output' );
+        chmod 0200, $file or die "protect the existing summary: $!";
+        my $append = World::observe( \@args, cwd => $root, env => { GITHUB_STEP_SUMMARY => $file } );
+        chmod 0600, $file or die "read the appended summary: $!";
+        is $append->{exit},     0,  'write permission is sufficient for a step summary';
+        is $append->{warnings}, [], 'the append emits no warning about the unreadable file';
+        like Test::Mutation::Source::read_bytes($file), qr/\Aearlier output\n## Mutation testing\n/,
+          'the report starts a new line when the earlier text cannot be read';
+    };
 };
 
 my $count = 0;

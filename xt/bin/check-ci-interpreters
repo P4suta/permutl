@@ -1,0 +1,54 @@
+#!perl
+use v5.36;
+use CPAN::Meta::YAML ();
+use Cwd              ();
+use File::Temp       ();
+
+my $jobs    = CPAN::Meta::YAML->read('.github/workflows/check.yml')->[0]{jobs};
+my $scratch = Cwd::abs_path( File::Temp::tempdir( CLEANUP => 1 ) );
+my $bundle  = "$scratch/candidate.bundle";
+system( 'git', 'bundle', 'create', $bundle, 'HEAD' ) == 0 or die "bundle the candidate commit\n";
+
+for my $kind (qw(driver shim)) {
+    my $job    = $jobs->{$kind};
+    my $matrix = $job->{strategy}{matrix};
+    my $step   = $job->{steps}[-1];
+    my @cases =
+        $kind eq 'driver'
+      ? $matrix->{include}->@*
+      : map { +{ perl => $_, 'require' => $step->{env}{TEST_MUTATION_REQUIRE} } } $matrix->{perl}->@*;
+    die "no $kind interpreters in check.yml\n" unless @cases;
+    my @command = split q{ }, $step->{run};
+    die "expected a prove invocation for $kind\n" unless grep { $_ eq 'prove' } @command;
+    for my $case (@cases) {
+        my $version = $case->{perl};
+        die "invalid Perl series: $version\n" unless $version =~ /\A5[.]\d+\z/;
+        my $base = 'perl' . ( $version =~ s/[.]//gr );
+        say "Checking the $kind on Perl $version";
+        open my $build, q{-|}, 'docker', 'build', '--quiet', '--platform', 'linux/amd64', '--target', "check-$kind",
+          '--build-arg', "CHECK_PERL=$base", '--file', 'xt/realworld/Dockerfile', q{.}
+          or die "start Docker: $!";
+        my $image = readline $build;
+        close $build or die "build the $kind for Perl $version\n";
+        chomp $image if defined $image;
+        die "expected the built image ID for Perl $version\n"
+          unless defined $image && $image =~ /\Asha256:[0-9a-f]{64}\z/;
+        system(
+            qw(docker run --init --rm --read-only),
+            qw(--platform linux/amd64 --network none),
+            qw(--cap-drop ALL --security-opt no-new-privileges),
+            qw(--cpus 3 --memory 4g --pids-limit 1024),
+            '--tmpfs',
+            '/work:exec,size=3g,uid=1000,gid=1000,mode=0755',
+            '--tmpfs',
+            '/tmp:exec,size=512m,mode=1777',
+            '--mount',
+            "type=bind,source=$bundle,target=/candidate.bundle,readonly",
+            '--env',
+            "TEST_MUTATION_REQUIRE=$case->{require}",
+            $image,
+            @command
+          ) == 0
+          or die "the $kind tests failed on Perl $version\n";
+    }
+}

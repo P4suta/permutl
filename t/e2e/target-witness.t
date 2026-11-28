@@ -5,6 +5,30 @@ use lib 't/e2e/lib';
 use Fixture qw(write_file run_fixture);
 use Test::Mutation::Source;
 
+subtest 'a child with a relative include path reports only the statements it executes' => sub {
+    my $root = File::Temp::tempdir( CLEANUP => 1 );
+    write_file( "$root/lib/Loaded.pm", <<'MODULE' );
+package Loaded;
+use strict;
+use warnings;
+sub reached { my ($x, $y) = @_; return $x + $y }
+sub unused { my ($x, $y) = @_; return $x * $y }
+1;
+MODULE
+    write_file( "$root/t/child.t", <<'TEST' );
+use Test::More tests => 1;
+delete $ENV{PERL5LIB};
+my $status = system $^X, '-Ilib', '-MLoaded', '-e', 'exit(Loaded::reached(2, 3) == 5 ? 0 : 1)';
+is $status, 0, 'the child calls the addition in the project module';
+TEST
+    my ($report) = run_fixture( $root, cache => 0, jobs => 2, equivalence => 0 );
+    is $report->baseline_failures, [], 'the unmodified child exits successfully';
+    my %arithmetic = map { $_->{mutant}->original => [ $_->@{qw(status covered_by)} ] }
+      grep { $_->{mutant}->mutator eq 'arithmetic' } $report->entries->@*;
+    is \%arithmetic, { '+' => [ 'Killed', ['t/child.t'] ], '*' => [ 'NoCoverage', [] ] },
+      'loading the module on the command line observes the addition and leaves the multiplication uncovered';
+};
+
 subtest 'children with an empty environment still identify the test that loaded the file' => sub {
     my $root = File::Temp::tempdir( CLEANUP => 1 );
     write_file( "$root/lib/Loaded.pm",

@@ -1,0 +1,32 @@
+#!/bin/sh
+set -eu
+
+root=$(git rev-parse --show-toplevel)
+cd "${root}"
+candidate=$(git rev-parse --verify HEAD)
+
+snapshot() {
+	git rev-parse --verify HEAD && git status --porcelain=v1 --untracked-files=all
+}
+
+initial=$(snapshot)
+if [ "${initial}" != "${candidate}" ]; then
+	echo 'The local release check needs a clean candidate checkout.' >&2
+	exit 1
+fi
+repository=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
+status() {
+	gh api --silent --method POST "repos/${repository}/statuses/${candidate}" \
+		-f "state=$1" -f context=release/local -f "description=$2"
+}
+
+status pending 'Running the local release gate'
+if mise run release-gate; then
+	current=$(snapshot)
+	if [ "${current}" = "${candidate}" ]; then
+		status success 'The local release gate passed'
+		exit 0
+	fi
+fi
+status failure 'The local release gate failed or the checkout changed'
+exit 1

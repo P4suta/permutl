@@ -1,6 +1,6 @@
 package SelfMeasurement;
 use v5.36;
-use List::Util qw(uniq);
+use List::Util qw(first max min uniq);
 use Test::Mutation::Report::Json;
 
 my %UNFINISHED = map { $_ => 1 } qw(Survived NoCoverage Timeout NoVerdict Pending);
@@ -10,6 +10,61 @@ sub read_report ($path) {
     my $json = do { local $/ = undef; readline $file };
     close $file or die "close $path: $!\n";
     return Test::Mutation::Report::Json::parse($json);
+}
+
+sub detector_hints ( $selection, @paths ) {
+    my %tests = map { $_ => 1 } $selection->tests->@*;
+    my ( %ids, %sites, %exact, %moved );
+    for my $mutant ( $selection->mutants->@* ) {
+        $ids{ $mutant->id } = 1;
+        push $sites{ $mutant->path }{ $mutant->start }->@*, $mutant;
+    }
+    for my $path (@paths) {
+        my $report = read_report($path);
+        my %locate;
+        for my $entry ( $report->entries->@* ) {
+            my ( $mutant, $test ) = $entry->@{qw(mutant by)};
+            next unless $entry->{status} eq 'Killed' && defined $test && $tests{$test};
+            if ( $ids{ $mutant->id } ) {
+                $exact{ $mutant->id } = $test;
+                next;
+            }
+            my $file = $mutant->path;
+            next unless $sites{$file};
+            $locate{$file} ||=
+              _locate_moved( $report->sources->{$file}, $selection->sources->{$file}->text, $sites{$file} );
+            my $found = $locate{$file}->($mutant);
+            $moved{ $found->id } = $test if $found;
+        }
+    }
+    return { %moved, %exact };
+}
+
+sub _unique_offset ( $source, $text ) {
+    my $offset = index( $source, $text );
+    return if $offset < 0 || index( $source, $text, $offset + 1 ) >= 0;
+    return $offset;
+}
+
+sub _locate_moved ( $original, $current, $sites ) {
+    my @lines  = split /\n/, $original, -1;
+    my $before = "\n$original\n";
+    my $after  = "\n$current\n";
+    return sub ($mutant) {
+        my ( $start_line, $end_line ) = $mutant->line_span->@*;
+        my $first   = max( 0, $start_line - 3 );
+        my $last    = min( $#lines, $end_line + 1 );
+        my $context = "\n" . join( "\n", @lines[ $first .. $last ] ) . "\n";
+        my $from    = _unique_offset( $before, $context );
+        my $to      = _unique_offset( $after,  $context );
+        return unless defined $from && defined $to;
+        my $offset = $to - $from;
+        return first {
+                 $_->end == $mutant->end + $offset
+              && $_->mutator eq $mutant->mutator
+              && $_->replacement eq $mutant->replacement
+        } @{ $sites->{ $mutant->start + $offset } || [] };
+    };
 }
 
 sub _inventory_findings ( $result, $selection, $expected ) {

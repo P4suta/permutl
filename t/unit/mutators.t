@@ -2,6 +2,7 @@ use v5.36;
 use Test2::V0;
 use File::Temp ();
 use lib 't/lib';
+use Bounded;
 use Raised;
 use Test::Mutation::Mutant::Generator;
 use Test::Mutation::Mutator::Catalog;
@@ -320,6 +321,8 @@ subtest 'word families' => sub {
       ),
       [ [ 'if', 'unless' ], [ ' $b > 1 ', '!( $b > 1 )' ], [ '$d + 1 : h($e)', 'h($e) : $d + 1' ] ],
       'an elsif condition is negated, and the branches of a conditional swap';
+    is changes( 'sub read_one { return $use_left ? <$left> : <$right> }', 'condition-negation' ),
+      [ [ '<$left> : <$right>', '<$right> : <$left>' ] ], 'a branch swap moves both delimiters of each readline';
     is changes( 'for (@a) { next if $_; last; redo }', 'loop-control' ),
       [ [ 'next', 'last' ], [ 'last', 'next' ], [ 'redo', 'next' ] ], 'loop control, where a redo becomes a next';
     is changes( 'my @t = ( defined $x, exists $h{a}, wantarray, -e $p, -s $q > 1, ref $r, - $s );', 'predicate' ),
@@ -418,7 +421,10 @@ subtest 'changes to control flow and operands respect Perl precedence' => sub {
     is changes( 'sub cmp_args { foo($x + $y <=> g($z), "$x" cmp $hash{key}); }', 'three-way' ),
       [ [ '$x + $y <=> g($z)', 'g($z) <=> $x + $y' ], [ '"$x" cmp $hash{key}', '$hash{key} cmp "$x"' ] ],
       'each three-way comparison swaps both complete operands';
-    is changes( 'sub f { g() or return 3; g() && die "error"; g() // last LOOP; g() || log_it(); }', 'early-exit' ),
+    is changes(
+        'sub f { g() or return 3; g() && die "error"; g() // last LOOP; g() || log_it(); }',
+        'early-exit', enable => ['early-exit']
+      ),
       [ [ 'or return 3', q{} ], [ '&& die "error"', q{} ], [ '// last LOOP', q{} ] ],
       'only a guarded transfer of control loses its tail';
     is changes( 'sub f { return abs($x) + int -2; } sub g { return abs; }', 'call-removal' ),
@@ -438,6 +444,100 @@ subtest 'changes to control flow and operands respect Perl precedence' => sub {
         [ '{ $_ }',             '{ !do { $_ } }' ],
       ],
       'grep and first negate their predicates while keeping their input lists';
+};
+
+sub flip_flop_cases () {
+    my $ranges_in = sub ($text) {
+        return grep { $_->mutator eq 'range-boundary' } mutants( $text, profile => 'extended' )->@*;
+    };
+    my $source = <<'CODE';
+sub select_lines {
+    for (@_) {
+        next unless /^=head1 AUTHORS/ ... /^=/;
+        return if ( $_ eq 'stop' ... $_ eq 'end' );
+    }
+}
+sub ranges {
+    my @copy = 1 ... $_[0];
+    return [1 ... $_[0]] if check(1 ... $_[0]);
+}
+sub values {
+    my $active = /begin/ ... /end/;
+    my @result = scalar(/begin/ ... /end/);
+    my $selected = (($active ... $result[0])) ? 1 : 0;
+    return $selected;
+}
+sub arguments {
+    my ($first) = /begin/ ... /end/;
+    my $object = shift;
+    return $object->scalar(/begin/ ... /end/);
+}
+sub unfinished { ... }
+CODE
+    my @ranges = $ranges_in->($source);
+    is [ map { [ $_->from->[0], $_->original, $_->replacement ] } @ranges ],
+      [ map { [ $_, '...', '..' ] } 3, 4, 12, 13, 14 ],
+      'scalar assignments, explicit scalar context, and conditions evaluate the range endpoint earlier';
+    my $blocks = <<'CODE';
+my @selected = grep { /begin/ ... /end/ } @input;
+my @sorted = sort { $a ... $b } @input;
+my @mapped = map { /begin/ ... /end/ } @input;
+my @all = grep { /begin/ ... /end/; 1 } @input;
+CODE
+    is [ map { $_->from->[0] } $ranges_in->($blocks) ], [ 1, 2 ],
+      'a filter predicate and a sort comparator consume the final block value in scalar context';
+    my $logical = <<'CODE';
+sub through_list {
+    my @items;
+    @items = 1 ... 3 and return @items;
+    push @items, 1 ... 3 or die;
+    print 1 ... 3 or die;
+}
+sub through_condition {
+    /begin/ ... /end/ and return 1;
+    (/left/ ... /right/) or die;
+}
+sub through_callback {
+    my $send = shift;
+    &$send(1 ... 3) or die 'nothing sent';
+}
+CODE
+    my @logical_ranges = $ranges_in->($logical);
+    is [ map { $_->from->[0] } @logical_ranges ], [ 8, 9 ],
+      'a logical operator tests its entire left operand after a list assignment or call finishes';
+    my $stream = <<'CODE';
+sub read_range {
+    my ($first, $last, $input) = @_;
+    my $right = $first ... <$input>;
+    my @list = $first ... <$input>;
+    my $left = <$input> ... $last;
+    return $right if $first < $last;
+}
+CODE
+    is [ map { $_->from->[0] } $ranges_in->($stream) ], [ 3, 5 ],
+      'a scalar range can read either endpoint from a filehandle';
+    is changes( $stream, 'comparison-negation' ), [ [ '<', '>=' ] ],
+      'only the comparison outside the filehandle reads can be negated';
+    return;
+}
+
+subtest 'a flip-flop can end on the same line as it starts' => sub {
+    my ($ended) = Bounded::ended( 2, \&flip_flop_cases );
+    ok $ended, 'range analysis terminates while following the enclosing syntax';
+};
+
+subtest 'guarded exits can be selected for a target with version-dependent startup code' => sub {
+    my $code = <<'PERL';
+use constant NEEDS_COMPAT => "$]" < 5.013_006;
+BEGIN { NEEDS_COMPAT and (eval { die "missing configuration" if $ENV{NO_CONFIG}; 1 } or die $@) }
+sub read_value { $_[0] or return 'missing'; return 'ready' }
+PERL
+    my $guards = [ [ 'or die $@', q{} ], [ "or return 'missing'", q{} ] ];
+    is changes( $code, 'early-exit' ), [], 'the default profile leaves the guarded exits unchanged';
+    is changes( $code, 'early-exit', profile => 'extended' ), $guards, 'the extended profile removes both exits';
+    is changes( $code, 'early-exit', enable  => ['early-exit'], perl => 5.010001 ), $guards,
+      'selecting the mutator keeps the startup guard on an older target';
+    is changes( $code, 'early-exit', enable => ['@removal'] ), $guards, 'the removal group includes guarded exits';
 };
 
 subtest 'extended mutators' => sub {

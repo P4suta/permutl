@@ -5,7 +5,7 @@ use Raised;
 use lib 't/e2e/lib';
 use Cwd        ();
 use File::Temp ();
-use Fixture    qw(copy_of ran_from write_file);
+use Fixture    qw(copy_of ran_from with_driver_shims write_file);
 use Test::Mutation;
 use Test::Mutation::Report::Json;
 use Test::Mutation::Runner;
@@ -78,14 +78,19 @@ sub limit () { _record() }
 MODULE
     write_file( "$project/lib/Boundary.pm", <<'MODULE' );
 package Boundary;
-use Test::Mutation::CompilerInputs ();
-use constant LIMIT => Test::Mutation::CompilerInputs::limit();
-sub above { return $_[0] > LIMIT }
+use Test::Mutation::CompilerInputs 0.100 ();
+sub above { return $_[0] > Test::Mutation::CompilerInputs::limit() }
 1;
 MODULE
-    write_file( "$project/t/pass.t", "use Test::More tests => 1; pass 'ready';\n" );
-    my $result = Test::Mutation::run( root => $project, source => ['lib/Boundary.pm'], jobs => 1, cache => 0 );
-    is $result->warnings, [], 'the original compiles with the project constant';
+    write_file( "$project/t/pass.t", <<'TEST' );
+use Test::More tests => 1;
+use Test::Mutation::CompilerInputs 0.100 ();
+is Test::Mutation::CompilerInputs::limit(), 7;
+TEST
+    my $result = with_driver_shims(
+        sub { Test::Mutation::run( root => $project, source => ['lib/Boundary.pm'], jobs => 1, cache => 0 ) } );
+    is $result->baseline_failures, [], 'the independent test calls the project function';
+    is $result->warnings,          [], 'the original compiles with the required project module version';
     ok scalar( grep { defined $_->{compiled_digest} } $result->entries->@* ),
       'the compiler compares changes to the uncovered boundary';
 

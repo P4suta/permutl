@@ -8,9 +8,22 @@ use Fcntl   qw(:flock);
 use Test::Mutation::Runner;
 use Test::Mutation::Settings;
 use Test::Mutation::Store;
+use Test::Mutation::Store::Key;
 use Test::Mutation::Status;
 
 my $dir = File::Temp::tempdir( CLEANUP => 1 );
+
+{
+    my $parent = File::Temp::tempdir( CLEANUP => 1 );
+    my $empty  = "$parent/empty";
+    mkdir $empty or die "mkdir $empty: $!";
+    write_file( "$parent/neighbor", "outside the project\n" );
+    is(
+        Test::Mutation::Store::Key::tree( $empty, ['../..'] ),
+        Test::Mutation::Store::Key::digest(),
+        'an empty project has no file or directory inputs'
+    ) or do { done_testing; exit 1 };
+}
 
 sub record (%fields) {
     return {
@@ -24,6 +37,18 @@ sub record (%fields) {
         code      => undef,
         %fields
     };
+}
+
+{
+    my $path            = "$dir/first/measurement.sqlite";
+    my $completed       = record( path => 'lib/Calc.pm', source => 'measured' );
+    my $checkpoint      = Test::Mutation::Store::checkpoints($path);
+    my $acknowledgement = $checkpoint->( 'first', $completed, 0 );
+    is(
+        [ $acknowledgement, Test::Mutation::Store::load($path) ],
+        [ 1,                { first => $completed } ],
+        'a nonblocking checkpoint acknowledges the verdict visible to the next reader'
+    ) or do { done_testing; exit 1 };
 }
 
 sub write_text ( $name, $text ) {
@@ -102,7 +127,6 @@ subtest 'an unusable file is an empty cache' => sub {
 };
 
 subtest 'partial baseline writes retain independent observations and measured verdicts' => sub {
-    my $path  = "$dir/originals.json";
     my $facts = {
         inputs    => 'one',
         includes  => ['lib'],
@@ -110,21 +134,28 @@ subtest 'partial baseline writes retain independent observations and measured ve
         files     => { 'lib/One.pm' => { traced => 1, hits => { 2 => 1 } } },
         breakable => { 'lib/One.pm' => { 2      => 1 } }
     };
-    my $other = { %$facts, inputs => 'two', files => {}, breakable => {} };
-    my $build = [ 'perl', 'Makefile.PL' ];
-    my $first = { 't/one.t' => $facts, 't/two.t' => $other };
-    Test::Mutation::Store::save( $path, { prior => record() }, undef, {}, { build => $build, tests => $first } );
-    is Test::Mutation::Store::originals($path), { build => $build, tests => $first },
-      'build arguments, duration and traced lines survive a round trip';
+    my $other  = { %$facts, inputs => 'two', files => {}, breakable => {} };
+    my $build  = [ 'perl', 'Makefile.PL' ];
+    my $first  = { 't/one.t' => $facts, 't/two.t' => $other };
     my $update = { 't/one.t' => undef, 't/three.t' => $facts };
-    Test::Mutation::Store::save( $path, {}, undef, {}, { build => [], tests => $update } );
-    my $kept = { 't/two.t' => $other, 't/three.t' => $facts };
-    is Test::Mutation::Store::originals($path), { build => [], tests => $kept },
-      'a partial write replaces the build, adds a new test and forgets the invalid observation';
-    Test::Mutation::Store::save( $path, {}, undef, {}, { build => $build, tests => {}, reset => 1 } );
-    is Test::Mutation::Store::originals($path), { build => $build, tests => {} },
-      'a reset clears every original even when no replacement tests are supplied';
-    is Test::Mutation::Store::load($path), { prior => record() }, 'baseline updates preserve verdicts';
+    my $kept   = { 't/two.t' => $other, 't/three.t' => $facts };
+    for my $format (qw(json sqlite)) {
+        subtest $format => sub {
+            my $path  = "$dir/originals.$format";
+            my $prior = record();
+            Test::Mutation::Store::save( $path, { prior => $prior }, undef, {}, { build => $build, tests => $first } );
+            is $prior, record(), 'saving a verdict preserves absent source fields in the caller';
+            is Test::Mutation::Store::originals($path), { build => $build, tests => $first },
+              'build arguments, duration and traced lines survive a round trip';
+            Test::Mutation::Store::save( $path, {}, undef, {}, { build => [], tests => $update } );
+            is Test::Mutation::Store::originals($path), { build => [], tests => $kept },
+              'a partial write replaces the build, adds a new test and forgets the invalid observation';
+            Test::Mutation::Store::save( $path, {}, undef, {}, { build => $build, tests => {}, reset => 1 } );
+            is Test::Mutation::Store::originals($path), { build => $build, tests => {} },
+              'a reset clears every original even when no replacement tests are supplied';
+            is Test::Mutation::Store::load($path), { prior => record() }, 'baseline updates preserve verdicts';
+        };
+    }
     my $broken = JSON::PP->new->encode(
         {
             version => Test::Mutation::Store::format_version(),
@@ -134,7 +165,7 @@ subtest 'partial baseline writes retain independent observations and measured ve
     );
     is Test::Mutation::Store::originals( write_text( 'broken-originals.json', $broken ) ),
       { build => [], tests => { valid => $facts } }, 'malformed observations or build arguments cannot be reused';
-    isa_ok dies { Test::Mutation::Store::originals( $path, 'extra' ) }, ['Error::TypeTiny'],
+    isa_ok dies { Test::Mutation::Store::originals( "$dir/originals.json", 'extra' ) }, ['Error::TypeTiny'],
       'the original lookup checks its path arguments';
 };
 
@@ -255,6 +286,7 @@ subtest 'each saved verdict requires the observations that justify its status' =
             detail     => undef,
           };
     }
+    $run->{compiler_of_mutant} = { map { ( $_->id, {} ) } $hit, $uncovered };
     Test::Mutation::Runner::_save_observation( $run, $cache, $_ ) for @entries;
     $cache->{records} = Test::Mutation::Store::load( $cache->{path} );
     is [ sort keys $cache->{records}->%* ], [ sort map { $_->id } $hit, $uncovered ],
@@ -266,11 +298,31 @@ subtest 'each saved verdict requires the observations that justify its status' =
     };
     is $reuse->( $cache, $hit, ['t/add.t'] ), undef, 'a recorded detection with changed inputs must be measured again';
     $cache->{records}{ $hit->id }{inputs} = $prior_key;
-    is $reuse->( $cache, $hit,       ['t/add.t'] )->{by}, 't/add.t', 'the verified detecting test is retained';
-    is $reuse->( $cache, $uncovered, [] )->{status}, 'NoCoverage',   'unchanged inputs can reuse an uncovered result';
+    my $proof = delete $cache->{records}{ $hit->id }{compiler_inputs};
+    is $reuse->( $cache, $hit, ['t/add.t'] ), undef,
+      'a legacy detection with unverified module imports needs new tests';
+    $cache->{records}{ $hit->id }{compiler_inputs} = $proof;
+    is $reuse->( $cache, $hit, ['t/add.t'] )->{by}, 't/add.t', 'the verified detecting test is retained';
+    my $binding = Test::Mutation::Mutant->new( $hit->%*, introduced_call => [ 'Calc::adjust', $hit->start ] );
+    is $reuse->( $cache, $binding, ['t/add.t'] ), undef,
+      'a candidate that probes a different function needs fresh tests';
+    my $scope = Test::Mutation::Mutant->new( $hit->%*, scope => [ $hit->scope->[0], $hit->scope->[1] + 1 ] );
+    is $reuse->( $cache, $scope, ['t/add.t'] ), undef, 'a different covering statement needs fresh observations';
+    my $description = Test::Mutation::Mutant->new( $hit->%*, description => 'Reworded replacement description' );
+    is $reuse->( $cache, $description, ['t/add.t'] )->{by}, 't/add.t',
+      'rewording the description preserves the detection';
+    is $reuse->( $cache, $uncovered, [] )->{status}, 'NoCoverage', 'unchanged inputs can reuse an uncovered result';
     is $reuse->( $cache, $uncovered, ['t/add.t'] ),  undef, 'a newly covering test invalidates an uncovered result';
     is $reuse->( { %$cache, shared => 'another environment' }, $uncovered, [] ), undef,
       'an uncovered result still depends on the original project and interpreter';
+    my $saved = $reuse->( $cache, $uncovered, [] );
+    $saved->{mutant} = Test::Mutation::Mutant->new( $uncovered->%*, comparable => 0 );
+    Test::Mutation::Runner::_save_observation( $run, $cache, $saved );
+    $cache->{records} = Test::Mutation::Store::load( $cache->{path} );
+    my @values       = map { Test::Mutation::Mutant->new( $uncovered->%*, comparable => $_ ) } ( q{}, undef );
+    my @observations = map { $reuse->( $cache, $_, [] ) } @values;
+    is [ map { $_ && $_->{status} } @observations ],
+      [qw(NoCoverage NoCoverage)], 'empty and undefined false values reuse a verdict recorded with numeric zero';
     my @warnings;
     local $SIG{__WARN__} = sub { push @warnings, @_; return };
     is $reuse->( $cache, $unrecorded, [] ), undef, 'an unknown mutant needs a fresh measurement';
@@ -298,8 +350,9 @@ PERL
     my %entries;
     ## no critic (Subroutines::ProtectPrivateSubs)
     my $next_job = Test::Mutation::Runner::_measurement_jobs( $sample_run, [ $detected, $other, $excluded ],
-        $baseline, undef, \%entries );
+        $baseline, { records => {} }, \%entries );
     ## use critic
+    is [ keys %entries ], [ $excluded->id ], 'cache misses occupy no result slots before the first job is requested';
     my @jobs;
     while ( my $job = $next_job->() ) { push @jobs, $job }
     is [ map { [ $_->{mutant}->id, $_->{tests} ] } @jobs ],

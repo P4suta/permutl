@@ -38,8 +38,11 @@ subtest 'the release call verifies the selected source without a publication cre
     is $gate->{uses}, './.github/workflows/release-gate.yml', 'the full repository release gate checks the candidate';
     is $gate->{with}{source_sha}, '${{ inputs.source_sha }}', 'verification checks the requested commit';
     is $gate->{with}{version},    '${{ inputs.version }}',    'verification checks the selected Perl version';
-    is $gate->{permissions}, { actions => 'read', contents => 'read' },
-      'candidate execution only reads repository data';
+    is $gate->{permissions}, { actions => 'read', contents => 'read', statuses => 'read' },
+      'the publication caller grants read access to artifacts, commits and local statuses';
+    my $proposal = YAML::PP->new( schema => ['Failsafe'] )->load_file('.github/workflows/release-please.yml');
+    is $proposal->{jobs}{publish}{permissions}{statuses}, 'read',
+      'the upstream reusable workflow grants access to local statuses';
     ok !exists $gate->{secrets}, 'candidate execution receives no environment credential';
     like $gate->{if}, qr{github[.]ref == 'refs/heads/main'}, 'the trusted workflow runs from main';
     like $gate->{if}, qr{github[.]ref_protected},            'publication requires branch protection';

@@ -66,6 +66,7 @@ PERL
 
 subtest 'binary source reads keep byte identity and a failed close supplies no text' => sub {
     my $root = project();
+    write_file( "$root/empty",   q{} );
     write_file( "$root/raw",     "\xC3\xA9\xFF\n" );
     write_file( "$root/read.pl", <<'PERL' );
 use strict;
@@ -80,14 +81,45 @@ BEGIN {
 use Test::Mutation::Shim ();
 my $read = \&Test::Mutation::Shim::_slurp;
 print 'raw=', unpack('H*', $read->('raw')), "\n";
+print 'empty=', defined($read->('empty')) ? 'read' : 'failed', "\n";
+print 'directory=', defined($read->('.')) ? 'read' : 'failed', "\n";
 $failed = 1;
-print 'failed=', length($read->('raw')), "\n";
-print 'missing=', length($read->('absent')), "\n";
+print 'failed=', defined($read->('raw')) ? 'read' : 'failed', "\n";
+print 'missing=', defined($read->('absent')) ? 'read' : 'failed', "\n";
 PERL
     my $run = run_perl( root => $root, args => [ '-I' . lib_dir(), '-Cio', 'read.pl' ] );
     is $run->{status}, 0, 'binary comparison handles the missing and unclosed file' or diag $run->{stderr};
-    is $run->{stdout}, "raw=c3a9ff0a\nfailed=0\nmissing=0\n", 'raw bytes and failed observations are distinct';
-    is $run->{stderr}, q{},                                   'failed reads do not leak warnings to the measured test';
+    is $run->{stdout}, "raw=c3a9ff0a\nempty=read\ndirectory=failed\nfailed=failed\nmissing=failed\n",
+      'only readable files supply bytes';
+    is $run->{stderr}, q{}, 'failed reads do not leak warnings to the measured test';
+};
+
+subtest 'an empty installed copy needs a readable original before the hook can replace it' => sub {
+    for my $removed ( 0, 1 ) {
+        my $root        = project();
+        my $original    = write_file( "$root/original/Blank.pm", q{} );
+        my $replacement = write_file( "$root/mutant.pm",         "package Blank; sub value { 53 } 1;\n" );
+        write_file( "$root/lib/Blank.pm", q{} );
+        write_file( "$root/spec",         "trace\t0\ntarget\t$original\t$replacement\n" );
+        write_file( "$root/use.pl",       <<'PERL' );
+unlink 'original/Blank.pm' or die "remove original: $!" if shift;
+require Blank;
+print Blank::value();
+PERL
+        my $run = run_perl(
+            root => $root,
+            args => [ '-I' . lib_dir(), '-Ilib', '-MTest::Mutation::Shim', 'use.pl', $removed ],
+            env  => { TEST_MUTATION_SPEC => "$root/spec", TEST_MUTATION_RECORD => "$root/records" }
+        );
+        if ($removed) {
+            isnt $run->{status}, 0, 'the empty installed module keeps its ordinary require failure';
+            like $run->{stderr}, qr/Blank[.]pm did not return a true value/, 'Perl reports the original failure';
+            is_deeply [ grep { $_->[0] eq 'seen' } @{ all_records($root) } ], [], 'the hook supplied no source';
+        }
+        else {
+            is_deeply [ $run->{status}, $run->{stdout} ], [ 0, '53' ], 'a copy of a readable empty file is replaced';
+        }
+    }
 };
 
 subtest 'an unquotable load path keeps its on-disk behavior in a placed run' => sub {
@@ -237,6 +269,73 @@ subtest 'a disappearing target or installed module supplies no file identity' =>
     is_deeply \@warnings, [], 'a missing identity does not leak comparison warnings to the measured program';
 };
 
+subtest 'the exit record identifies a module loaded before the observer started' => sub {
+    for my $placed ( 0, 1 ) {
+        my $root   = project();
+        my $loaded = write_file( "$root/installed/Resident.pm", "package Resident;\nsub value { 37 }\n1;\n" );
+        my $other  = write_file( "$root/copy/Resident.pm",      "die 'the other file was loaded';\n" );
+        my $pid    = fork;
+        die "fork: $!" unless defined $pid;
+        if ( !$pid ) {
+            require $loaded;
+            Test::Mutation::Shim::activate(
+                {
+                    observe => 1,
+                    placed  => $placed,
+                    targets => [ map { { original => $_, serve => $_ } } $other, $loaded ]
+                },
+                "$root/records"
+            );
+            exit( Resident::value() == 37 ? 0 : 1 );
+        }
+        waitpid $pid, 0;
+        is $?, 0, 'the interpreter used the implementation in the installed module';
+        my $load = $placed ? [ 'blind', $loaded, 'loaded-at-exit' ] : [ 'around', $loaded ];
+        is_deeply all_records($root), [ [ 'begin', 0 ], $load, [ 'end', $pid ] ],
+          'only the loaded inode supplies an exit observation';
+    }
+};
+
+subtest 'a relative module registry entry does not identify another file after chdir' => sub {
+    for my $case (
+        [ 'load then move',   0, 1, 17, 0 ],
+        [ 'move then load',   1, 0, 29, 0 ],
+        [ 'return from load', 1, 1, 29, 0 ],
+        [ 'absolute load',    0, 1, 17, 1 ],
+        [ 'untracked source', 0, 1, 17, 0, 1 ],
+      )
+    {
+        my ( $name, $move_first, $move_last, $value, $absolute, $untracked ) = @$case;
+        my $root    = project();
+        my $first   = write_file( "$root/lib/Resident.pm",       "package Resident; sub value { 17 } 1;\n" );
+        my $other   = write_file( "$root/other/lib/Resident.pm", "package Resident; sub value { 29 } 1;\n" );
+        my @targets = $untracked ? ($other) : ( $first, $other );
+        my $spec    = join q{}, map { "target\t$_\t$_\n" } @targets;
+        write_file( "$root/spec",    "trace\t0\nobserve\t1\nplaced\t1\n$spec" );
+        write_file( "$root/move.pl", <<'PERL' );
+my ($before, $after, $absolute) = @ARGV;
+chdir 'other' or die "enter other directory: $!" if $before;
+if (length $absolute) { require $absolute } else { require Resident }
+print Resident::value(), "\n", $INC{$absolute || 'Resident.pm'}, "\n";
+chdir($before ? '..' : 'other') or die "change directory after require: $!" if $after;
+PERL
+        my $run = run_perl(
+            root => $root,
+            args => [
+                '-I' . lib_dir(), '-Ilib',    '-MTest::Mutation::Shim', 'move.pl',
+                $move_first,      $move_last, $absolute ? $first : q{}
+            ],
+            env => { TEST_MUTATION_SPEC => "$root/spec", TEST_MUTATION_RECORD => "$root/records" }
+        );
+        is $run->{status}, 0, "$name: the ordinary require completes" or diag $run->{stderr};
+        is $run->{stdout}, "$value\n" . ( $absolute ? $first : 'lib/Resident.pm' ) . "\n",
+          "$name: the program identifies the value loaded and the path that Perl registered";
+        my @observed = grep { $_->[0] eq 'blind' || $_->[0] eq 'around' } @{ all_records($root) };
+        is_deeply \@observed, $absolute ? [ [ 'blind', $first, 'loaded-at-exit' ] ] : [],
+          "$name: only an unambiguous file identity supplies coverage";
+    }
+};
+
 subtest 'the command selector stops before looking up aliases for a missing main program' => sub {
     my $root = project();
     write_file( "$root/bin/tool",  "print 1;\n" );
@@ -265,6 +364,39 @@ PERL
     is $run->{status}, 0,                             'absent commands remain uninstrumented' or diag $run->{stderr};
     is $run->{stdout}, "irrelevant=0\ngone/tool=1\n", 'an unrelated name needs no lookup and a missing main needs one';
     is $run->{stderr}, q{},                           'unavailable identities cause no warnings';
+};
+
+subtest 'observe mode leaves the test in control of loading Cwd' => sub {
+    my $root = project();
+    write_file( "$root/lib/Cwd.pm", "package Cwd; sub value { 41 } 1;\n" );
+    write_file( "$root/spec",       "trace\t0\nobserve\t1\n" );
+    my $run = ShimHarness::run_bare(
+        root => $root,
+        args => [
+            '-I' . lib_dir(),
+            '-Ilib', '-MTest::Mutation::Shim', '-e',
+            'print exists $INC{"Cwd.pm"} ? "preloaded " : "unloaded "; require Cwd; print Cwd::value()'
+        ],
+        env => { TEST_MUTATION_SPEC => "$root/spec", TEST_MUTATION_RECORD => "$root/records" }
+    );
+    is_deeply [ $run->{status}, $run->{stdout} ], [ 0, 'unloaded 41' ],
+      'the test loads its own Cwd after observation starts'
+      or diag $run->{stderr};
+};
+
+subtest 'the main program retains its identity after changing working directory' => sub {
+    my $root   = project();
+    my $script = write_file( "$root/bin/app.pl",       "chdir 'other' or die \$!;\nprint 17;\n" );
+    my $other  = write_file( "$root/other/bin/app.pl", "print 29;\n" );
+    write_file( "$root/spec", "trace\t0\nobserve\t1\nplaced\t1\ntarget\t$script\t$script\ntarget\t$other\t$other\n" );
+    my $run = run_perl(
+        root => $root,
+        args => [ '-I' . lib_dir(), '-MTest::Mutation::Shim', 'bin/app.pl' ],
+        env  => { TEST_MUTATION_SPEC => "$root/spec", TEST_MUTATION_RECORD => "$root/records" }
+    );
+    is_deeply [ $run->{status}, $run->{stdout} ], [ 0, '17' ], 'Perl executes the script opened in the first directory';
+    is_deeply [ grep { $_->[0] eq 'blind' } @{ all_records($root) } ], [ [ 'blind', $script, 'loaded-at-exit' ] ],
+      'file coverage belongs to the main program that started';
 };
 
 subtest 'witnesses distinguish served targets from unseen targets with and without a tracer' => sub {
@@ -318,8 +450,8 @@ PERL
     my $records = all_records($root);
     is scalar( grep { $_->[0] eq 'seen' && $_->[1] eq $main } @$records ), 1,
       'a witnessed main program reports its compilation';
-    is scalar( grep { $_->[0] eq 'blind' && $_->[1] eq $later } @$records ), 1,
-      'the ordinary require has only on-disk evidence';
+    is_deeply [ grep { defined $_->[1] && $_->[1] eq $later } @$records ], [ [ 'blind', $later, 'loaded-at-exit' ] ],
+      'the module registry identifies the ordinary require at process exit';
     is scalar( grep { $_->[0] eq 'hit' && $_->[1] ne $main } @$records ), 0, 'only the selected main has hit records';
 };
 

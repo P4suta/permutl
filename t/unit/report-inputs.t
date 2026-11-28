@@ -2,11 +2,14 @@ use v5.36;
 use Test2::V0;
 use Cwd              ();
 use Digest::SHA      ();
+use Encode           ();
 use Fcntl            qw(LOCK_EX LOCK_NB O_RDONLY);
 use File::Copy       ();
 use File::Temp       ();
 use IO::Socket::UNIX ();
 use Socket           ();
+use lib 't/lib';
+use Capability;
 use lib 't/e2e/lib';
 use Fixture qw(write_file);
 use Test::Mutation::Store::Key;
@@ -16,6 +19,20 @@ my $root = Cwd::abs_path( File::Temp::tempdir( CLEANUP => 1 ) );
 sub tree ( $inside = $root ) {
     return Test::Mutation::Store::Key::tree( $inside, [], 1 );
 }
+
+subtest 'publication operations validate the names and digests they accept' => sub {
+    require Test::Mutation::Report::Publication;
+    my $directory = File::Temp::tempdir( CLEANUP => 1 );
+    isa_ok dies { Test::Mutation::Report::Publication::names('mutation.json') }, ['Error::TypeTiny'],
+      'the name list takes no arguments';
+    isa_ok dies { Test::Mutation::Report::Publication::outputs( $directory, [] ) }, ['Error::TypeTiny'],
+      'the relative directory must be a string';
+    isa_ok dies { Test::Mutation::Store::Key::published_outputs( $directory, [], [ [] ] ) }, ['Error::TypeTiny'],
+      'every linked input needs a path string';
+    isa_ok
+      dies { Test::Mutation::Report::Publication::record( $directory, $directory, { 'mutation.json' => 'short' } ) },
+      ['Error::TypeTiny'], 'a published checksum must contain a complete SHA-256 digest';
+};
 
 subtest 'project data can describe a mutation framework' => sub {
     for my $format (qw(json html)) {
@@ -133,6 +150,20 @@ subtest 'only published bytes at their recorded paths leave the project input' =
     isnt tree(), $copied, 'copying a whole report directory does not exempt its contents at another path';
 };
 
+subtest 'a report in a Unicode directory has the same record for characters and path bytes' => sub {
+    my $name      = "\x{5831}\x{544a}";
+    my $bytes     = Encode::encode( 'UTF-8', $name );
+    my $directory = "$root/$bytes";
+    my $json      = 'published report';
+    write_file( "$directory/mutation.json", $json );
+    my $digest = Digest::SHA::sha256_hex($json);
+    Test::Mutation::Report::Publication::record( $root, $directory, { 'mutation.json' => $digest } );
+    for my $relative ( $name, $bytes ) {
+        is Test::Mutation::Report::Publication::outputs( $directory, $relative )->{'mutation.json'}, $digest,
+          'the published report matches its relative name';
+    }
+};
+
 subtest 'publishing preserves a user file with the metadata name and leaves external directories alone' => sub {
     require Test::Mutation::Report::Publication;
     my $directory = "$root/conflict";
@@ -157,6 +188,45 @@ subtest 'publishing preserves a user file with the metadata name and leaves exte
     my $outside = File::Temp::tempdir( CLEANUP => 1 );
     Test::Mutation::Report::Publication::record( $root, $outside, $payload );
     ok !-e "$outside/.test-mutation-outputs", 'publishing outside the measured tree needs no metadata';
+};
+
+subtest 'a publication reports an error when its destination is a file' => sub {
+    my $destination = write_file( "$root/plain-file", 'ordinary input' );
+    my $failure     = dies {
+        Test::Mutation::Report::Publication::record( $root, $destination, { 'mutation.json' => 'c' x 64 } );
+    };
+    is $failure, object { call id => 'file-unwritable' }, 'the caller learns why recording the report failed';
+};
+
+subtest 'only a regular publication record in its own directory identifies generated files' => sub {
+    my $name      = 'linked-record';
+    my $directory = "$root/$name";
+    write_file( "$directory/mutation.json", 'saved report' );
+    my $digest = Digest::SHA::sha256_hex('saved report');
+    Test::Mutation::Report::Publication::record( $root, $directory, { 'mutation.json' => $digest } );
+    my $marker = "$directory/.test-mutation-outputs";
+    rename $marker, "$directory/previous" or die "move the record: $!";
+    symlink 'previous', $marker or die "link the record: $!";
+    is Test::Mutation::Report::Publication::outputs( $directory, $name ), {},
+      'a symbolic link to an earlier record leaves the files in the measurement';
+    my $replacement = { 'mutation.json' => 'b' x 64 };
+    is warnings { Test::Mutation::Report::Publication::record( $root, $directory, $replacement ) }, [],
+      'skipping a linked record reports no filehandle warnings';
+    unlink $marker or die "remove the link: $!";
+    rename "$directory/previous", $marker or die "restore the record: $!";
+    is Test::Mutation::Report::Publication::outputs( $directory, $name )->{'mutation.json'}, $digest,
+      'the earlier publication still records its original bytes';
+};
+
+subtest 'malformed publication records leave the directory in the measurement' => sub {
+    my $name      = 'invalid-record';
+    my $directory = "$root/$name";
+    my $seal      = Digest::SHA::sha256_hex( join "\0", $name, 'invalid', '-' );
+    for my $text ( 'x' x 512, join( "\n", $seal, 'invalid', '-', q{} ) ) {
+        write_file( "$directory/.test-mutation-outputs", $text );
+        is Test::Mutation::Report::Publication::outputs( $directory, $name ), {},
+          'an oversized record or invalid checksum identifies no generated file';
+    }
 };
 
 subtest 'a file moved onto the metadata path during publication survives' => sub {
@@ -219,8 +289,74 @@ subtest 'a project copy keeps a relative link target and reports dangling links 
     my %omitted = map { $_ => 1 } $view->{outputs}->@*;
     ok !$omitted{history} && !$omitted{'history/mutation.json'}, 'the link has its original directory and file';
     ok $omitted{'history/mutation.html'}, 'a sibling publication that the link cannot reach stays hidden';
+    is $view->{digest}, Test::Mutation::Store::Key::tree( $project, $view->{outputs} ),
+      'the project fingerprint includes all bytes that an isolated copy exposes through a link';
+    is Test::Mutation::Store::Key::published_outputs( $project, [], [] ), $view->{outputs},
+      'an isolated copy keeps every published path reached through an ordinary link';
+    is Test::Mutation::Store::Key::published_outputs( $project, [], ['history'] ), [],
+      'an explicitly linked directory exposes its original publications';
     is Test::Mutation::Store::Key::project( $project, [], ['history'] )->{outputs}, [],
       'a directory explicitly linked to the real project exposes all its contents';
+};
+
+subtest 'finding published paths reads only files that could still match a publication' => sub {
+    my $project = Cwd::abs_path( File::Temp::tempdir( CLEANUP => 1 ) );
+    my $history = "$project/history";
+    my $data    = 'archived result';
+    write_file( "$history/$_", $data ) for qw(mutation.html mutation.json);
+    Test::Mutation::Report::Publication::record( $project, $history,
+        { map { $_ => Digest::SHA::sha256_hex($data) } qw(mutation.html mutation.json) } );
+    chmod 0755, "$history/mutation.html" or die "set executable mode: $!";
+    write_file( "$project/spec/mutation.json", 'project data' );
+    write_file( "$project/share/operand",      'ordinary input' );
+    symlink 'history/mutation.html', "$project/command" or die "link the executable: $!";
+    my @reads;
+    my $file = \&Test::Mutation::Store::Key::file;
+    no warnings 'redefine';
+    local *Test::Mutation::Store::Key::file = sub ($path) {
+        push @reads, $path;
+        return $file->($path);
+    };
+    my @published = qw(history/.test-mutation-outputs history/mutation.json);
+    is Test::Mutation::Store::Key::published_outputs( $project, [], [] ), \@published,
+      'the executable and both ordinary input directories stay in the copy';
+    is [ sort @reads ], [ map { "$project/$_" } @published ],
+      'only verifiable publication records and report bytes were read';
+    symlink 'history/mutation.json', "$project/operand" or die "link the report: $!";
+    @reads = ();
+    is Test::Mutation::Store::Key::published_outputs( $project, [], [] ), [ $published[0] ],
+      'a linked report stays visible as a project input';
+    is [ sort @reads ], [ map { "$project/$_" } @published ],
+      'keeping a linked report does not require reading unrelated input bytes';
+};
+
+subtest 'unreadable entries cannot hide a verified report in another directory' => sub {
+    Capability::has( 'unprivileged', $> != 0, 'the fixture needs restricted directory permissions' ) or return;
+    my $project = Cwd::abs_path( File::Temp::tempdir( CLEANUP => 1 ) );
+    my $history = "$project/history";
+    my $digest  = Digest::SHA::sha256_hex('report bytes');
+    write_file( "$history/$_", 'report bytes' ) for qw(mutation.html mutation.json);
+    Test::Mutation::Report::Publication::record( $project, $history,
+        { 'mutation.html' => $digest, 'mutation.json' => $digest } );
+    write_file( "$project/$_/mutation.json", 'private' ) for qw(unlisted unsearchable);
+    chmod 0111, "$project/unlisted"      or die "restrict listing: $!";
+    chmod 0444, "$project/unsearchable"  or die "restrict search: $!";
+    chmod 0000, "$history/mutation.html" or die "restrict report: $!";
+    my $outputs = \&Test::Mutation::Report::Publication::outputs;
+    my ( @inspected, $found );
+    {
+        no warnings 'redefine';
+        local *Test::Mutation::Report::Publication::outputs = sub ( $directory, $relative ) {
+            push @inspected, $relative;
+            return $outputs->( $directory, $relative );
+        };
+        is dies { $found = Test::Mutation::Store::Key::published_outputs( $project, [], [] ) }, undef,
+          'the isolated copy can identify outputs with an unreadable file and inaccessible directories';
+    }
+    chmod( 0700, "$project/unlisted", "$project/unsearchable" ) == 2 or die "restore directories: $!";
+    is \@inspected, ['history'], 'publication records are opened only in searchable directories';
+    is $found, [qw(history/.test-mutation-outputs history/mutation.json)],
+      'the unreadable report stays in the copy and the verified sibling is omitted';
 };
 
 subtest 'a socket at a former report path is never opened as a report' => sub {

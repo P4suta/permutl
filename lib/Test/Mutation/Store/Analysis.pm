@@ -104,13 +104,13 @@ sub publish ( $path, $pending ) {
                 my ( $identity, $result ) = @$queued;
                 my %facts   = %$result;
                 my $mutants = delete $facts{mutants};
-                next unless 0 + $file->execute( $identity, $JSON->encode( \%facts ) );
+                next if $file->execute( $identity, $JSON->encode( \%facts ) ) == 0;
                 my $order = 0;
                 for my $mutant (@$mutants) {
                     $candidate->execute( $identity, $order++, $mutant->id, $JSON->encode( { $mutant->%* } ) );
                 }
             }
-            return 1;
+            return;
         }
     );
     return;

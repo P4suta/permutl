@@ -1,7 +1,10 @@
 use v5.36;
 use Test2::V0;
-use File::Temp ();
-use POSIX      ();
+use File::Copy       ();
+use File::Temp       ();
+use IO::Socket::UNIX ();
+use POSIX            ();
+use Socket           ();
 use Test::Mutation::Report::Json;
 use lib 't/e2e/lib';
 use Fixture qw(ran write_file);
@@ -27,6 +30,30 @@ my $whole = report('json');
 my %first = map { $_->{mutant}->id => $_->{status} } $whole->entries->@*;
 my ($id)  = grep { $first{$_} eq 'Survived' } sort keys %first;
 ok defined $id, 'the original suite misses a change';
+subtest 'inspection uses the older valid report when the newer file is incomplete' => sub {
+    my $history = File::Temp::tempdir( CLEANUP => 1 );
+    for my $case ( [ json => 'html', q{} ], [ json => 'html', '{"files":' ], [ html => 'json', '<html></html>' ], ) {
+        my ( $newer, $older, $broken ) = @$case;
+        my $valid = "$history/mutation.$older";
+        File::Copy::copy( "$files/mutation.$older", $valid ) or die "copy the older report: $!";
+        utime 1, 1, $valid or die "date the older report: $!";
+        write_file( "$history/mutation.$newer", $broken );
+        my $shown = ran( 0, $project, 'show', $id, '--no-cache', '--report-dir', $history );
+        like $shown->{stdout}, qr/^Last result: Survived$/m, "the older $older report supplies the result";
+    }
+};
+subtest 'inspection skips a socket at the newer report path' => sub {
+    my $history = File::Temp::tempdir( DIR => '/tmp', CLEANUP => 1 );
+    my $older   = "$history/mutation.html";
+    File::Copy::copy( "$files/mutation.html", $older ) or die "copy the HTML report: $!";
+    utime 1, 1, $older or die "date the HTML report: $!";
+    my $path   = "$history/mutation.json";
+    my $socket = IO::Socket::UNIX->new( Type => Socket::SOCK_STREAM(), Local => $path, Listen => 1 )
+      or die "listen at the other report path: $!";
+    my $shown = ran( 0, $project, 'show', $id, '--no-cache', '--report-dir', $history );
+    like $shown->{stdout}, qr/^Last result: Survived$/m, 'the regular HTML file supplies the verdict';
+    ok -S $path, 'inspection preserves the live socket';
+};
 write_file( "$project/t/stronger.t", "use Test::More tests => 1;\nuse Totals;\nis Totals::sum(4, 1), 5;\n" );
 ran( 0, $project, @options, '--mutant', $id );
 for my $format (qw(json html)) {

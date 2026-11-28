@@ -120,6 +120,8 @@ write_file( "$scratch/$_", "local build data\n" ) for @private;
 my @release_tools = qw(
   release-please-config.json xt/release-please/package.json xt/release-please/node_modules/dependency/index.js
   xt/release-publish/draft.rs xt/release-workflow.t xt/publication-workflow.t xt/release-archive.t xt/bin/verify-release-archive
+  xt/local-release-check.t xt/bin/record-release-check xt/bin/verify-local-release-check
+  xt/ci-interpreters.t xt/bin/check-ci-interpreters
 );
 write_file( "$scratch/$_", "release automation\n" ) for grep { !-e "$scratch/$_" } @release_tools;
 ok in_scratch( 'git', 'add', '--force', '--', @release_tools ), 'the release tools are tracked'
@@ -137,6 +139,7 @@ my @wanted = qw(
   Makefile.PL cpanfile META.json .perlcriticrc .perltidyrc README.md Changes LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES.md bin/mutation
   lib/Test/Mutation.pm lib/Test/Mutation/Shim.pm lib/Test/Mutation/Report/resources/mutation-test-elements.js
   t/unit/tap.t t/shim/serve.t t/fixtures/calc/lib/Calc.pm
+  t/e2e/confirm-detectors.t xt/bin/confirm-self-measurement xt/lib/SelfMeasurement.pm
 );
 is [ grep { !$packed{"$prefix/$_"} } @wanted ], [], 'the archive holds the sources, the tests, and the notices';
 is build_output( $prefix, keys %packed ),       [], 'and leaves out installed dependencies, build output, and reports';

@@ -36,6 +36,7 @@ use Test::Mutation::Workspace::Slot;
 use Test::Mutation::Source;
 use Test::Mutation::Record;
 use Test::Mutation::Report::Html;
+use Test::Mutation::Report::Publication;
 
 my $directory = File::Temp::tempdir( CLEANUP => 1 );
 
@@ -120,6 +121,16 @@ ok length Test::Mutation::Report::Html::viewer_script(), 'the viewer script is r
 like dies {
     failing_in( qr/::Html::viewer_script\z/, sub { Test::Mutation::Report::Html::viewer_script() } )
 }, qr/\Acannot close \S+mutation-test-elements[.]js: /, 'a viewer script that does not close is an error';
+
+my $published = { 'mutation.json' => 'b' x 64 };
+like dies {
+    failing_in( qr/::Publication::record\z/,
+        sub { Test::Mutation::Report::Publication::record( $directory, $directory, $published ) } )
+}, qr/\Acannot close .*\.test-mutation-outputs: /, 'a failed close prevents successful publication';
+Test::Mutation::Report::Publication::record( $directory, $directory, $published );
+like dies {
+    failing_in( qr/::Publication::outputs\z/, sub { Test::Mutation::Report::Publication::outputs( $directory, q{.} ) } )
+}, qr/\Acannot close .*\.test-mutation-outputs: /, 'a read handle that fails to close cannot identify published files';
 
 my $target = write_file( 'slot-source.pm', "1;\n" );
 like dies {

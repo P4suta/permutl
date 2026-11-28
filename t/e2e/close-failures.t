@@ -20,7 +20,7 @@ BEGIN {
 }
 
 use lib 't/e2e/lib', 't/lib';
-use Fixture qw(copy_of leftovers run_fixture);
+use Fixture qw(copy_of leftovers run_fixture with_driver_shims);
 use Test::Mutation::CLI;
 use Test::Mutation::Settings;
 use Test::Mutation::Runner;
@@ -70,7 +70,7 @@ sub command (@arguments) {
         local *STDERR;    ## no critic (Variables::RequireInitializationForLocalVars)
         open STDOUT, '>', \$output or die "stdout: $!";
         open STDERR, '>', \$errors or die "stderr: $!";
-        Test::Mutation::CLI::main(@arguments);
+        with_driver_shims( sub { Test::Mutation::CLI::main(@arguments) } );
     };
     chdir $here or die "chdir: $!";
     return ( $status, $errors, $output );

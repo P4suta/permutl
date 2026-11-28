@@ -54,7 +54,7 @@ sub columns () {
 signature_for overview => ( positional => [$RESULT], returns => ArrayRef [Str] );
 
 sub overview ($result) {
-    my $selection = $result->measured_scope // $result->selection;
+    my $selection = $result->score_scope;
     my @scope;
     push @scope, 'previously undetected mutants' if $selection->{undetected};
     if ( !$selection->{undetected} && $selection->{mutants} ) {

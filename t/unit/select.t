@@ -4,8 +4,9 @@ use Cwd         ();
 use Digest::SHA ();
 use File::Temp  ();
 use lib 't/e2e/lib', 't/lib';
-use Fixture qw(write_file);
+use Fixture qw(copy_of with_driver_shims write_file);
 use Raised;
+use Test::Mutation::Merge;
 use Test::Mutation::Select;
 use Test::Mutation::Selection;
 use Test::Mutation::Runner;
@@ -147,6 +148,7 @@ subtest 'a report identifies the requested lines and the inputs that support the
     write_file( "$project/$first",   "package A;\nsub one { return 1 + 1 }\n1;\n" );
     write_file( "$project/$chosen",  "package Z;\nsub two { return 2 + 2 }\n1;\n" );
     write_file( "$project/t/pass.t", "use Test::More tests => 1;\nok 1;\n" );
+    my %rules;
     for my $cache ( 0, 1 ) {
         for my $reports ( 0, 1 ) {
             my $config   = Test::Mutation::Settings::of_call( { root => $project, cache => $cache } );
@@ -159,13 +161,65 @@ subtest 'a report identifies the requested lines and the inputs that support the
             is [ sort keys $selected->sources->%* ], [$chosen], 'an earlier file cannot hide the selected source';
             is [ sort keys $selected->digests->%* ], $cache || $reports ? [ $first, $chosen ] : [$chosen],
               "cache $cache and reports $reports retain the required input digests";
+            $rules{ $selected->analysis_rules_digest }++;
         }
     }
+    is [ values %rules ], [4], 'all four selections use the same analysis rules';
     my $whole = Test::Mutation::Select::resolve( config => Test::Mutation::Settings::of_call( { root => $project } ) );
     my %attributes = $whole->%*;
     delete $attributes{selection};
     is Test::Mutation::Selection->new(%attributes)->selection, {},
       'an unfiltered selection constructed without an explicit filter records the whole project';
+    delete $attributes{analysis_rules_digest};
+    is Test::Mutation::Selection->new(%attributes)->analysis_rules_digest, $whole->catalog_digest,
+      'a selection supplied without separate analysis rules retains its catalog identity';
+};
+
+subtest 'a prepared shard and a resolved shard can measure the same source lines' => sub {
+    my $project = copy_of('calc');
+    write_file( "$project/lib/Other.pm", "package Other; 1;\n" );
+    my $paths = { 'lib/Calc.pm' => [ [ 7, 7 ] ] };
+    my ( $first_config, $peer_config ) =
+      map { Test::Mutation::Settings::of_call( { root => $project, shard => "$_/2", cache => $_ - 1 } ); } 1, 2;
+    my $run = sub ( $config, $scope ) {
+        return with_driver_shims(
+            sub {
+                Test::Mutation::Runner::run( $config, sub { }, $scope );
+            }
+        );
+    };
+    my $peer    = $run->( $peer_config, { paths => $paths } );
+    my $measure = sub ( $selection, $config ) {
+        my %inputs = $selection->%*;
+        delete $inputs{analysis_rules_digest};
+        my $prepared = Test::Mutation::Selection->new(%inputs);
+        return $run->( $config, { selection => $prepared } );
+    };
+    my $selected = Test::Mutation::Select::resolve( config => $first_config, paths => $paths );
+    my $merge    = sub ( $part, $other ) {
+        return Test::Mutation::Merge::merge(
+            [ { name => 'prepared', result => $part }, { name => 'peer', result => $other } ] );
+    };
+    my $part   = $measure->( $selected, $first_config );
+    my $merged = $merge->( $part, $peer );
+    is scalar( $merged->entries->@* ), $selected->inventory->{mutants}, 'both parts restore the selected inventory';
+    ok $merged->tally->{counts}{Killed}, 'the merged report contains an observed test failure';
+    my $previous;
+    {
+        local $Test::Mutation::Select::ANALYSIS_REVISION = $Test::Mutation::Select::ANALYSIS_REVISION - 1;
+        $previous = Test::Mutation::Select::resolve( config => $first_config, paths => $paths );
+    }
+    my $old_part = $measure->( $previous, $first_config );
+    like dies { $merge->( $old_part, $peer ) }, qr/measurement inputs differ/,
+      'a catalog from an earlier analyzer revision cannot identify the current rules';
+    my $strict = Test::Mutation::Settings::of_call(
+        { root => $project, shard => '2/2', cache => 1, suppress_require_reason => 1 } );
+    my $other_rules = Test::Mutation::Select::resolve( config => $strict, paths => $paths );
+    my $strict_peer = $measure->( $other_rules, $peer_config );
+    like dies { $merge->( $part, $strict_peer ) }, qr/measurement inputs differ/,
+      'a different suppression policy cannot identify the current rules';
+    like dies { $merge->( $old_part, $strict_peer ) }, qr/measurement inputs differ/,
+      'shards from two different prepared catalogs retain their own identities';
 };
 
 done_testing;
